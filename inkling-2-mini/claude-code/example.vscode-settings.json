@@ -1,0 +1,8 @@
+{
+  // Workspace-only: routes the Claude Code extension in THIS folder to the local Inkling 2 Mini server.
+  // Start the server first: D:\Models\Inki\start_inkling_fast.ps1  (http://127.0.0.1:8080)
+  "claudeCode.environmentVariables": [
+    { "name": "ANTHROPIC_BASE_URL", "value": "http://127.0.0.1:8080" },
+    { "name": "ANTHROPIC_AUTH_TOKEN", "value": "local-inkling" }
+  ]
+}

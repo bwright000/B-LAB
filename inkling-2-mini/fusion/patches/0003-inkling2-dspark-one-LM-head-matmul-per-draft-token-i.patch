@@ -1,0 +1,50 @@
+From 5fa5237e4419a0a961d7259ef90574e34a93e695 Mon Sep 17 00:00:00 2001
+From: bwright000 <benjamin.wright.25@ucl.ac.uk>
+Date: Sat, 21 Nov 2026 19:30:12 +0000
+Subject: [PATCH 3/3] inkling2 dspark: one LM-head matmul per draft token
+ instead of two
+
+W*hidden + W*correction == W*(hidden + correction): reads the 0.38 GB
+(vocab x n_embd) LM head once per draft token. Drafter-only change, so
+verification keeps the output exact; acceptance unchanged (681/1028).
+RTX 5070 Ti, n_max=2: 131.8 -> 139.4 tok/s.
+LLAMA_INKLING_DSPARK_TWO_HEADS=1 restores the two-matmul path (TEMP).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/dspark.cpp | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index 47c8663af..5ecdb3282 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -254,11 +254,20 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
+     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
+     auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+     const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
+-    auto * base = g.build_lora_mm(output, hidden, scale);
+-    auto * bias = g.build_lora_mm(output, correction, scale);
+-    ggml_prec_set_acc(base, GGML_PREC_F32);
+-    ggml_prec_set_acc(bias, GGML_PREC_F32);
+-    auto * logits = ggml_add(g.ctx0, base, bias);
++    // W*hidden + W*correction == W*(hidden + correction): one read of the (vocab x n_embd) LM head per draft token
++    // instead of two. Drafter-only change: proposals may round differently, but verification keeps the output exact.
++    static const bool two_reads = getenv("LLAMA_INKLING_DSPARK_TWO_HEADS") != nullptr;
++    ggml_tensor * logits;
++    if (two_reads) {
++        auto * base = g.build_lora_mm(output, hidden, scale);
++        auto * bias = g.build_lora_mm(output, correction, scale);
++        ggml_prec_set_acc(base, GGML_PREC_F32);
++        ggml_prec_set_acc(bias, GGML_PREC_F32);
++        logits = ggml_add(g.ctx0, base, bias);
++    } else {
++        logits = g.build_lora_mm(output, ggml_add(g.ctx0, hidden, correction), scale);
++        ggml_prec_set_acc(logits, GGML_PREC_F32);
++    }
+     logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, hidden->ne[1], logits->nb[1], 0));
+     const float cap = model.hparams.f_final_logit_softcapping;
+     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
+-- 
+2.56.1.windows.1
+

@@ -1,0 +1,134 @@
+{
+    "_base_args":  [
+                       "-m",
+                       "D:\\Models\\Inki\\gguf\\Inkling-2-Mini-UD-Q3_K_XL.gguf",
+                       "-ngl",
+                       "99",
+                       "-fa",
+                       "on",
+                       "-c",
+                       "32768",
+                       "-ub",
+                       "256",
+                       "-ctk",
+                       "q8_0",
+                       "-ctv",
+                       "q8_0",
+                       "--parallel",
+                       "1",
+                       "--load-mode",
+                       "none",
+                       "--jinja",
+                       "--chat-template-kwargs",
+                       "{\"reasoning_effort\":\"low\"}",
+                       "--temp",
+                       "1.0",
+                       "--top-p",
+                       "1.0",
+                       "--top-k",
+                       "0",
+                       "--min-p",
+                       "0.0",
+                       "--host",
+                       "127.0.0.1",
+                       "--port",
+                       "8091",
+                       "-bs"
+                   ],
+    "ctl":  {
+                "why":  "control = current best (start_inkling.ps1 on port 8091)"
+            },
+    "bs":  {
+               "add":  [
+                           "-bs"
+                       ],
+               "why":  "backend sampling: pick the token on the GPU instead of copying 201K logits to CPU every step (skill: keep sampling on the GPU)"
+           },
+    "pdl":  {
+                "env":  {
+                            "GGML_CUDA_PDL":  "1"
+                        },
+                "why":  "programmatic dependent launch: next kernel\u0027s prologue overlaps the previous kernel\u0027s tail -\u003e less gap between the hundreds of small kernels"
+            },
+    "gopt":  {
+                 "env":  {
+                             "GGML_CUDA_GRAPH_OPT":  "1"
+                         },
+                 "why":  "CUDA graph optimisation pass (reorders/concurrent nodes); targets per-token launch overhead"
+             },
+    "up":  {
+               "binary":  "D:\\Models\\Inki\\llama-up\\llama-server.exe",
+               "why":  "upstream ggml-org b12606 (CUDA 13.5 runtime bundled) vs Unsloth b12568/CUDA 12: 38 builds newer, newer CUDA graph/kernel code"
+           },
+    "prio":  {
+                 "add":  [
+                             "--prio",
+                             "2",
+                             "--poll",
+                             "100"
+                         ],
+                 "why":  "high CPU priority + busy-poll: the CPU prepares/launches each token\u0027s graph with less OS scheduling latency"
+             },
+    "t4":  {
+               "add":  [
+                           "-t",
+                           "4"
+                       ],
+               "why":  "4 CPU threads instead of 16: less thread wake-up/sync cost per token when the CPU only orchestrates the GPU"
+           },
+    "t1":  {
+               "add":  [
+                           "-t",
+                           "1"
+                       ],
+               "why":  "1 CPU thread: zero thread synchronisation per token (all compute is on the GPU)"
+           },
+    "mmids":  {
+                  "env":  {
+                              "GGML_CUDA_MM_IDS_SORT":  "1"
+                          },
+                  "why":  "sort tokens by expert id in the MoE matmul kernel"
+              },
+    "nofuse":  {
+                   "env":  {
+                               "GGML_CUDA_DISABLE_FUSION":  "1"
+                           },
+                   "why":  "DIAGNOSTIC: turn kernel fusion off. If speed drops a lot, launch count matters and more fusion would help"
+               },
+    "t2":  {
+               "add":  [
+                           "-t",
+                           "2"
+                       ],
+               "why":  "2 CPU threads: between t1 and t4"
+           },
+    "upq3":  {
+                 "binary":  "D:\\Models\\Inki\\llama-up\\llama-server.exe",
+                 "model":  "D:\\Models\\Inki\\gguf\\ggml-org\\Inkling-2-Mini-Q3_K_M-imat.gguf",
+                 "why":  "upstream ggml-org b12606 engine + its own GGUF format, requantized Q8_0 -\u003e Q3_K_M with ggml-org imatrix (12.78 GiB, 4.21 bpw ~ same as Unsloth Q3_K_XL 12.70 GiB/4.18 bpw)"
+             },
+    "src":  {
+                "binary":  "D:\\Models\\Inki\\src\\llama.cpp\\build\\bin\\llama-server.exe",
+                "model":  "D:\\Models\\Inki\\gguf\\ggml-org\\Inkling-2-Mini-Q3_K_M-imat.gguf",
+                "why":  "all fusions incl. GGML_OP_INKLING_MIX (not bit-exact; KLD at the model rounding floor)"
+            },
+    "srcunf":  {
+                   "binary":  "D:\\Models\\Inki\\src\\llama.cpp\\build\\bin\\llama-server.exe",
+                   "model":  "D:\\Models\\Inki\\gguf\\ggml-org\\Inkling-2-Mini-Q3_K_M-imat.gguf",
+                   "env":  {
+                               "LLAMA_INKLING_UNFUSED":  "1",
+                               "GGML_CUDA_NO_INKLING_CLIP":  "1",
+                               "GGML_CUDA_NO_INKLING_CONV":  "1",
+                               "GGML_CUDA_NO_INKLING_GATE":  "1"
+                           },
+                   "why":  "control: same binary as src with ALL Inkling fusions off (SITU op, clip, convolve head+tail)"
+               },
+    "srcexact":  {
+                     "binary":  "D:\\Models\\Inki\\src\\llama.cpp\\build\\bin\\llama-server.exe",
+                     "model":  "D:\\Models\\Inki\\gguf\\ggml-org\\Inkling-2-Mini-Q3_K_M-imat.gguf",
+                     "env":  {
+                                 "LLAMA_INKLING_NO_MIXOP":  "1"
+                             },
+                     "why":  "exact fusions only (mix op off): bit-identical to unfused"
+                 }
+}

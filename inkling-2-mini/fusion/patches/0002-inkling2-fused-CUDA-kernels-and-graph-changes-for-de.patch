@@ -1,0 +1,1937 @@
+From 6ca86622ead943b9ba9e175a46958ca441e5e08f Mon Sep 17 00:00:00 2001
+From: bwright000 <benjamin.wright.25@ucl.ac.uk>
+Date: Sat, 21 Nov 2026 19:30:12 +0000
+Subject: [PATCH 2/3] inkling2: fused CUDA kernels and graph changes for decode
+ speed
+
+Cuts GPU kernels per decoded token from ~7,350 to ~3,700 on Inkling 2 Mini
+(RTX 5070 Ti: decode 80 -> 105 tok/s via llama-server, prefill +32-37%).
+
+- ggml: GGML_GLU_OP_SITU (CPU + CUDA) replacing the 9-op SITU chain
+- ggml: GGML_OP_INKLING_MIX fused depth attention (CPU reference + CUDA,
+  split 2-kernel path for few tokens); not bit-exact, KLD at the model's
+  rounding floor (~0.003, same as disabling the standard CUDA fusions)
+- ggml-cuda: pattern fusions in ggml_cuda_try_fuse: L2 clip chain,
+  convolve head (concat + conv-state copy) and tail (ssm_conv + residual
+  + scale [+ trailing residual add]), control tanh gates, fused control
+  second half (2 fp32 matvecs + gates, T<=8)
+- inkling2: stacked-prefix concat cache and no query repeat at decode in
+  mix(), concat-then-rms_norm in control(), strided views instead of copies
+- tests: test-backend-ops cases for SITU and INKLING_MIX
+
+TEMP A/B switches (remove before upstreaming): LLAMA_INKLING_UNFUSED,
+LLAMA_INKLING_NO_MIXOP, GGML_CUDA_NO_INKLING_{CLIP,CONV,GATE,CTRL},
+GGML_CUDA_INKLING_MIX_NO_SPLIT, INKLING_FUSE_DEBUG.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                  |  23 +
+ ggml/src/ggml-cpu/ggml-cpu.c         |   9 +
+ ggml/src/ggml-cpu/ops.cpp            | 143 +++++
+ ggml/src/ggml-cpu/ops.h              |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu      |  61 ++
+ ggml/src/ggml-cuda/inkling-fused.cu  | 894 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/inkling-fused.cuh |  26 +
+ ggml/src/ggml-cuda/ssm-conv.cu       |  63 +-
+ ggml/src/ggml-cuda/ssm-conv.cuh      |   4 +
+ ggml/src/ggml-cuda/unary.cu          |  66 ++
+ ggml/src/ggml-cuda/unary.cuh         |   2 +
+ ggml/src/ggml.c                      |  54 +-
+ src/llama-graph.cpp                  |  16 +-
+ src/models/inkling2.cpp              |  60 +-
+ src/models/models.h                  |   3 +
+ tests/test-backend-ops.cpp           | 101 ++-
+ 16 files changed, 1504 insertions(+), 22 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/inkling-fused.cu
+ create mode 100644 ggml/src/ggml-cuda/inkling-fused.cuh
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 7c5b1e552..6a1ce6dc4 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -433,6 +433,8 @@ extern "C" {
+ 
+         GGML_OP_SLEEP,
+ 
++        GGML_OP_INKLING_MIX,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -471,6 +473,7 @@ extern "C" {
+         GGML_GLU_OP_GEGLU_ERF,
+         GGML_GLU_OP_GEGLU_QUICK,
+         GGML_GLU_OP_SWIGLU_CLAMP,
++        GGML_GLU_OP_SITU,
+ 
+         GGML_GLU_OP_COUNT,
+     };
+@@ -1198,6 +1201,26 @@ extern "C" {
+             float                 alpha,
+             float                 limit);
+ 
++    // Inkling 2 depth attention ("mix"): states = [stack (n_blocks vectors, optional), cur], each RMS-normalized (eps);
++    // p = softmax_j(scale * <state_j, query_i>);  out_i = sum_j p_ij * state_j
++    // stack [n_embd, n_blocks, n_tokens] or NULL, cur [n_embd, n_tokens], query [n_embd, n_q]  ->  [n_embd, n_q, n_tokens]
++    GGML_API struct ggml_tensor * ggml_inkling_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * stack,
++            struct ggml_tensor  * cur,
++            struct ggml_tensor  * query,
++            float                 eps,
++            float                 scale);
++
++    // situ(a, b) = beta*tanh(a/beta)*sigmoid(a) * (linear_beta > 0 ? linear_beta*tanh(b/linear_beta) : b)
++    // a is the gate, b the up projection (Inkling 2 experts)
++    GGML_API struct ggml_tensor * ggml_situ(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            float                 beta,
++            float                 linear_beta);
++
+     GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 4d9760bad..8ce670090 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2073,6 +2073,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_glu(params, tensor);
+             } break;
++        case GGML_OP_INKLING_MIX:
++            {
++                ggml_compute_forward_inkling_mix(params, tensor);
++            } break;
+         case GGML_OP_GET_REL_POS:
+             {
+                 ggml_compute_forward_get_rel_pos(params, tensor);
+@@ -2314,6 +2318,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = 1;
+             } break;
++        case GGML_OP_INKLING_MIX:
++            {
++                n_tasks = n_threads;
++            } break;
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(node)) {
+                 case GGML_UNARY_OP_ABS:
+@@ -2358,6 +2366,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                 case GGML_GLU_OP_SWIGLU_CLAMP:
++                case GGML_GLU_OP_SITU:
+                     {
+                         n_tasks = n_threads;
+                     } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index cd8134740..e2550addc 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3573,6 +3573,81 @@ static void ggml_compute_forward_swiglu_oai(
+     }
+ }
+ 
++// ggml_compute_forward_situ
++// same op order as the unfused graph: scale(tanh(scale(x, 1/beta)), beta) * sigmoid(x) * scale(tanh(scale(y, 1/lb)), lb)
++
++static void ggml_compute_forward_situ_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    char * src0_d = (char *) src0->data;
++    char * src1_d = (char *) (src1 ? src1->data : src0->data);
++    const size_t src0_o = src0->nb[1];
++    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
++
++    GGML_ASSERT(ggml_is_contiguous_1(src0));
++    GGML_ASSERT(ggml_is_contiguous_1(dst));
++
++    if (src1) {
++        GGML_ASSERT(ggml_is_contiguous_1(src1));
++        GGML_ASSERT(src0->type == src1->type);
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
++    const int nr = ggml_nrows(src0);
++
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == nr);
++
++    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
++    const float beta      = ggml_get_op_params_f32(dst, 2);
++    const float lb        = ggml_get_op_params_f32(dst, 3);
++    const float inv_beta  = 1.0f/beta;
++    const float inv_lb    = lb > 0.0f ? 1.0f/lb : 0.0f;
++
++    const int dr  = (nr + nth - 1)/nth;
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++
++    for (int i1 = ir0; i1 < ir1; i1++) {
++        float * src0_p = (float *) (src0_d + i1*src0_o);
++        float * src1_p = (float *) (src1_d + i1*src1_o);
++        float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
++
++        if (!src1) {
++            src0_p += swapped ? nc : 0;
++            src1_p += swapped ? 0 : nc;
++        }
++
++        for (int k = 0; k < nc; k++) {
++            const float x   = src0_p[k];
++            const float act = (tanhf(x*inv_beta)*beta) * (1.0f/(1.0f + expf(-x)));
++            const float up  = lb > 0.0f ? tanhf(src1_p[k]*inv_lb)*lb : src1_p[k];
++            dst_p[k] = act*up;
++        }
++    }
++}
++
++static void ggml_compute_forward_situ(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_situ_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("situ: only F32 is supported");
++            }
++    }
++}
++
+ // ggml_compute_forward_swiglu_clamp
+ 
+ static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+@@ -10477,6 +10552,70 @@ void ggml_compute_forward_unary(
+ 
+ //ggml_compute_forward_glu
+ 
++// ggml_compute_forward_inkling_mix (reference: rms_norm each state, softmax(scale * <state, query>), weighted sum)
++
++void ggml_compute_forward_inkling_mix(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * cur   = dst->src[0];
++    const ggml_tensor * query = dst->src[1];
++    const ggml_tensor * stack = dst->src[2];
++
++    const int64_t n_embd   = cur->ne[0];
++    const int64_t n_tokens = cur->ne[1];
++    const int64_t n_q      = query->ne[1];
++    const int64_t n_blocks = stack ? stack->ne[1] : 0;
++    const int64_t n_states = n_blocks + 1;
++
++    const float eps   = ggml_get_op_params_f32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++
++    std::vector<const float *> states(n_states);
++    std::vector<float>         inv(n_states);
++    std::vector<float>         p(n_states);
++
++    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
++        for (int64_t j = 0; j < n_blocks; ++j) {
++            states[j] = (const float *) ((const char *) stack->data + j*stack->nb[1] + t*stack->nb[2]);
++        }
++        states[n_blocks] = (const float *) ((const char *) cur->data + t*cur->nb[1]);
++
++        for (int64_t j = 0; j < n_states; ++j) {
++            ggml_float ss = 0.0;
++            for (int64_t e = 0; e < n_embd; ++e) {
++                ss += (ggml_float) states[j][e] * states[j][e];
++            }
++            inv[j] = 1.0f/sqrtf((float) (ss/n_embd) + eps);
++        }
++
++        for (int64_t i = 0; i < n_q; ++i) {
++            const float * q = (const float *) ((const char *) query->data + i*query->nb[1]);
++            float max = -INFINITY;
++            for (int64_t j = 0; j < n_states; ++j) {
++                ggml_float d = 0.0;
++                for (int64_t e = 0; e < n_embd; ++e) {
++                    d += (ggml_float) states[j][e] * q[e];
++                }
++                p[j] = scale * inv[j] * (float) d;
++                max  = std::max(max, p[j]);
++            }
++            float sum = 0.0f;
++            for (int64_t j = 0; j < n_states; ++j) {
++                p[j] = expf(p[j] - max);
++                sum += p[j];
++            }
++            float * out = (float *) ((char *) dst->data + i*dst->nb[1] + t*dst->nb[2]);
++            for (int64_t e = 0; e < n_embd; ++e) {
++                float acc = 0.0f;
++                for (int64_t j = 0; j < n_states; ++j) {
++                    acc += (p[j]/sum) * inv[j] * states[j][e];
++                }
++                out[e] = acc;
++            }
++        }
++    }
++}
++
+ void ggml_compute_forward_glu(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -10512,6 +10651,10 @@ void ggml_compute_forward_glu(
+             {
+                 ggml_compute_forward_swiglu_clamp(params, dst);
+             } break;
++        case GGML_GLU_OP_SITU:
++            {
++                ggml_compute_forward_situ(params, dst);
++            } break;
+         default:
+             {
+                 GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 3a4fa0707..b2b5d39d0 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -96,6 +96,7 @@ void ggml_compute_forward_win_part(const struct ggml_compute_params * params, st
+ void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_unary(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_inkling_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_get_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_add_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rwkv_wkv6(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3e1f167e9..ec987cc21 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -61,6 +61,7 @@
+ #include "ggml-cuda/tsembd.cuh"
+ #include "ggml-cuda/topk-moe.cuh"
+ #include "ggml-cuda/unary.cuh"
++#include "ggml-cuda/inkling-fused.cuh"
+ #include "ggml-cuda/upscale.cuh"
+ #include "ggml-cuda/wkv.cuh"
+ #include "ggml-cuda/gla.cuh"
+@@ -2957,6 +2958,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                     ggml_cuda_op_swiglu_clamp(ctx, dst);
+                     break;
++                case GGML_GLU_OP_SITU:
++                    ggml_cuda_op_situ(ctx, dst);
++                    break;
+                 default:
+                     return false;
+             }
+@@ -3099,6 +3103,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_SSM_CONV:
+             ggml_cuda_op_ssm_conv(ctx, dst);
+             break;
++        case GGML_OP_INKLING_MIX:
++            ggml_cuda_op_inkling_mix(ctx, dst);
++            break;
+         case GGML_OP_SSM_SCAN:
+             ggml_cuda_op_ssm_scan(ctx, dst);
+             break;
+@@ -4474,6 +4481,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // Inkling 2 control second half (2 matvecs + both gates -> 1 kernel, not bit-exact); GGML_CUDA_NO_INKLING_CTRL=1 disables it
++    if (node->op == GGML_OP_MUL_MAT) {
++        static const bool no_ctrl = getenv("GGML_CUDA_NO_INKLING_CTRL") != nullptr;
++        if (!no_ctrl) {
++            if (const int n = ggml_cuda_try_fuse_inkling_control_gates(*cuda_ctx, cgraph, i)) {
++                return n;
++            }
++        }
++    }
++
++    // Inkling 2 loop-control gates (TANH, MUL, SUB/ADD -> 1 kernel); GGML_CUDA_NO_INKLING_GATE=1 disables it
++    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_TANH) {
++        static const bool no_gate = getenv("GGML_CUDA_NO_INKLING_GATE") != nullptr;
++        if (!no_gate) {
++            if (const int n = ggml_cuda_try_fuse_inkling_tanh_gate(*cuda_ctx, cgraph, i)) {
++                return n;
++            }
++        }
++    }
++
++    // Inkling 2 convolve head (CONCAT + state CPY -> 1 kernel); disabled together with the tail by GGML_CUDA_NO_INKLING_CONV=1
++    if (node->op == GGML_OP_CONCAT) {
++        static const bool no_conv = getenv("GGML_CUDA_NO_INKLING_CONV") != nullptr;
++        if (!no_conv) {
++            if (const int n = ggml_cuda_try_fuse_inkling_concat_state(*cuda_ctx, cgraph, i)) {
++                return n;
++            }
++        }
++    }
++
++    // Inkling 2 convolve tail (4 nodes -> 1 kernel); GGML_CUDA_NO_INKLING_CONV=1 disables it for A/B checks
++    if (node->op == GGML_OP_SSM_CONV) {
++        static const bool no_conv = getenv("GGML_CUDA_NO_INKLING_CONV") != nullptr;
++        if (!no_conv) {
++            if (const int n = ggml_cuda_try_fuse_inkling_conv(*cuda_ctx, cgraph, i)) {
++                return n;
++            }
++        }
++    }
++
++    // Inkling 2 L2 clip chain (8/9 nodes -> 1 kernel); GGML_CUDA_NO_INKLING_CLIP=1 disables it for A/B checks
++    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
++        static const bool no_clip = getenv("GGML_CUDA_NO_INKLING_CLIP") != nullptr;
++        if (!no_clip) {
++            if (const int n = ggml_cuda_try_fuse_inkling_clip(*cuda_ctx, cgraph, i)) {
++                return n;
++            }
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+@@ -6395,6 +6452,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                         return false;
+                     }
+                     return ggml_is_contiguous_1(op->src[0]);
++                case GGML_GLU_OP_SITU:
++                    return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[0]);
+                 default:
+                     return false;
+             }
+@@ -6722,6 +6781,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             // assumes d_inner % threads == 0
+             return op->src[0]->ne[1] % 128 == 0;
+         }
++        case GGML_OP_INKLING_MIX:
++            return ggml_cuda_inkling_mix_supported(op);
+         case GGML_OP_CONT:
+             return true;
+         case GGML_OP_SOFT_MAX:
+diff --git a/ggml/src/ggml-cuda/inkling-fused.cu b/ggml/src/ggml-cuda/inkling-fused.cu
+new file mode 100644
+index 000000000..822b393aa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-fused.cu
+@@ -0,0 +1,894 @@
++#include "inkling-fused.cuh"
++#include "ssm-conv.cuh"
++#include "../ggml-impl.h"
++
++static bool inkling_is_view_op(enum ggml_op op) {
++    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
++}
++
++static bool inkling_overlaps(const ggml_tensor * a, const ggml_tensor * c) {
++    const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
++    const char * c0 = (const char *) c->data; const char * c1 = c0 + ggml_nbytes(c);
++    return a0 < c1 && c0 < a1;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// GGML_OP_INKLING_MIX: depth attention in one kernel (replaces concat, rms_norm, repeat, transpose+cont, 2 matmuls, softmax)
++// One block per token. Pass 1: per state, sum of squares and the dot products with every query (one sweep, one block
++// reduction). Then a softmax per query. Pass 2: out_i = sum_j (p_ij * inv_rms_j) * state_j.
++// ---------------------------------------------------------------------------------------------------------------------
++#define INKLING_MIX_MAX_STATES 32
++#define INKLING_MIX_MAX_Q      4
++#define INKLING_MIX_THREADS    512   // generic path: 16 warps, pass 1 gives each warp its own states
++#define INKLING_MIX_FAST_THREADS 256 // fast path (<= 16 states)
++
++static __global__ void inkling_mix_f32(
++        const float * cur, const float * query, const float * stack, float * dst,
++        const int n_embd, const int n_q, const int n_blocks,
++        const int64_t cur_nb1, const int64_t q_nb1, const int64_t st_nb1, const int64_t st_nb2,
++        const int64_t d_nb1, const int64_t d_nb2, const float eps, const float scale) {
++    const int t = blockIdx.x;
++    const int n_states = n_blocks + 1;
++
++    __shared__ float inv[INKLING_MIX_MAX_STATES];
++    __shared__ float w[INKLING_MIX_MAX_Q][INKLING_MIX_MAX_STATES];   // scores, then p_ij * inv_j
++
++    auto state = [&](int j) -> const float * {
++        return j < n_blocks ? (const float *) ((const char *) stack + j*st_nb1 + t*st_nb2)
++                            : (const float *) ((const char *) cur + t*cur_nb1);
++    };
++
++    const int warp    = threadIdx.x / WARP_SIZE;
++    const int lane    = threadIdx.x % WARP_SIZE;
++    const int n_warps = blockDim.x / WARP_SIZE;
++
++    // pass 1: one warp per state (warp-level reductions only, all states in parallel)
++    for (int j = warp; j < n_states; j += n_warps) {
++        const float * s = state(j);
++        float acc[INKLING_MIX_MAX_Q + 1] = { 0.0f };
++        for (int e = lane; e < n_embd; e += WARP_SIZE) {
++            const float v = s[e];
++            acc[0] += v*v;
++#pragma unroll
++            for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                if (i < n_q) {
++                    acc[i + 1] += v * ((const float *) ((const char *) query + i*q_nb1))[e];
++                }
++            }
++        }
++#pragma unroll
++        for (int k = 0; k < INKLING_MIX_MAX_Q + 1; ++k) {
++            acc[k] = warp_reduce_sum(acc[k]);
++        }
++        if (lane == 0) {
++            const float r = rsqrtf(acc[0] / n_embd + eps);
++            inv[j] = r;
++#pragma unroll
++            for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                if (i < n_q) {
++                    w[i][j] = scale * r * acc[i + 1];
++                }
++            }
++        }
++    }
++    __syncthreads();
++
++    // softmax over the states, one thread per query; fold the rms factor into the weights
++    if (threadIdx.x < n_q) {
++        const int i = threadIdx.x;
++        float max = -INFINITY;
++        for (int j = 0; j < n_states; ++j) {
++            max = fmaxf(max, w[i][j]);
++        }
++        float sum = 0.0f;
++        for (int j = 0; j < n_states; ++j) {
++            w[i][j] = expf(w[i][j] - max);
++            sum += w[i][j];
++        }
++        for (int j = 0; j < n_states; ++j) {
++            w[i][j] = w[i][j] / sum * inv[j];
++        }
++    }
++    __syncthreads();
++
++    for (int e = threadIdx.x; e < n_embd; e += blockDim.x) {
++        float acc[INKLING_MIX_MAX_Q] = { 0.0f };
++        for (int j = 0; j < n_states; ++j) {
++            const float v = state(j)[e];
++#pragma unroll
++            for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                acc[i] += w[i][j] * v;
++            }
++        }
++        for (int i = 0; i < n_q; ++i) {
++            ((float *) ((char *) dst + i*d_nb1 + t*d_nb2))[e] = acc[i];
++        }
++    }
++}
++
++// Fast path for up to MAXS states: every thread accumulates its slice of ALL states' sums of squares and query dots in
++// registers (many independent loads in flight), then a single combined block reduction. Decode runs one block per
++// token, so this kernel is latency-bound: maximise memory-level parallelism, minimise sequential sync rounds.
++template <int MAXS>
++static __global__ void inkling_mix_fast_f32(
++        const float * cur, const float * query, const float * stack, float * dst,
++        const int n_embd, const int n_q, const int n_blocks,
++        const int64_t cur_nb1, const int64_t q_nb1, const int64_t st_nb1, const int64_t st_nb2,
++        const int64_t d_nb1, const int64_t d_nb2, const float eps, const float scale) {
++    constexpr int NV = MAXS * (INKLING_MIX_MAX_Q + 1);
++    const int t = blockIdx.x;
++    const int n_states = n_blocks + 1;
++
++    __shared__ float red[INKLING_MIX_FAST_THREADS / WARP_SIZE][NV];
++    __shared__ float inv[MAXS];
++    __shared__ float w[INKLING_MIX_MAX_Q][MAXS];
++
++    const float * sp[MAXS];
++#pragma unroll
++    for (int j = 0; j < MAXS; ++j) {
++        sp[j] = j < n_blocks ? (const float *) ((const char *) stack + j*st_nb1 + t*st_nb2)
++                             : (const float *) ((const char *) cur + t*cur_nb1);
++    }
++
++    float acc[NV];
++#pragma unroll
++    for (int k = 0; k < NV; ++k) {
++        acc[k] = 0.0f;
++    }
++    for (int e = threadIdx.x; e < n_embd; e += blockDim.x) {
++        float q[INKLING_MIX_MAX_Q];
++#pragma unroll
++        for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++            q[i] = i < n_q ? ((const float *) ((const char *) query + i*q_nb1))[e] : 0.0f;
++        }
++#pragma unroll
++        for (int j = 0; j < MAXS; ++j) {
++            if (j < n_states) {
++                const float v = sp[j][e];
++                acc[j*(INKLING_MIX_MAX_Q + 1)] += v*v;
++#pragma unroll
++                for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                    acc[j*(INKLING_MIX_MAX_Q + 1) + 1 + i] += v*q[i];
++                }
++            }
++        }
++    }
++
++    const int warp = threadIdx.x / WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++#pragma unroll
++    for (int k = 0; k < NV; ++k) {
++        acc[k] = warp_reduce_sum(acc[k]);
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int k = 0; k < NV; ++k) {
++            red[warp][k] = acc[k];
++        }
++    }
++    __syncthreads();
++
++    // one thread per state: finish the reduction, rms factor and scores
++    if (threadIdx.x < n_states) {
++        const int j = threadIdx.x;
++        float tot[INKLING_MIX_MAX_Q + 1] = { 0.0f };
++        for (int wi = 0; wi < (int) (blockDim.x / WARP_SIZE); ++wi) {
++#pragma unroll
++            for (int k = 0; k < INKLING_MIX_MAX_Q + 1; ++k) {
++                tot[k] += red[wi][j*(INKLING_MIX_MAX_Q + 1) + k];
++            }
++        }
++        const float r = rsqrtf(tot[0] / n_embd + eps);
++        inv[j] = r;
++#pragma unroll
++        for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++            if (i < n_q) {
++                w[i][j] = scale * r * tot[i + 1];
++            }
++        }
++    }
++    __syncthreads();
++
++    if (threadIdx.x < n_q) {
++        const int i = threadIdx.x;
++        float max = -INFINITY;
++        for (int j = 0; j < n_states; ++j) {
++            max = fmaxf(max, w[i][j]);
++        }
++        float sum = 0.0f;
++        for (int j = 0; j < n_states; ++j) {
++            w[i][j] = expf(w[i][j] - max);
++            sum += w[i][j];
++        }
++        for (int j = 0; j < n_states; ++j) {
++            w[i][j] = w[i][j] / sum * inv[j];
++        }
++    }
++    __syncthreads();
++
++    for (int e = threadIdx.x; e < n_embd; e += blockDim.x) {
++        float o[INKLING_MIX_MAX_Q] = { 0.0f };
++#pragma unroll
++        for (int j = 0; j < MAXS; ++j) {
++            if (j < n_states) {
++                const float v = sp[j][e];
++#pragma unroll
++                for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                    o[i] += w[i][j] * v;
++                }
++            }
++        }
++        for (int i = 0; i < n_q; ++i) {
++            ((float *) ((char *) dst + i*d_nb1 + t*d_nb2))[e] = o[i];
++        }
++    }
++}
++
++// Split path for few tokens (decode): the single-block-per-token kernel leaves 69 of 70 SMs idle at T=1.
++// Kernel A: grid (chunks, T), each block reduces its 256-element slice of every state into partial sums.
++// Kernel B: grid (chunks, T), each block sums the partials, does the (tiny, redundant) softmax, writes its slice.
++#define INKLING_MIX_CHUNK 256
++
++template <int MAXS>
++static __global__ void inkling_mix_partial_f32(
++        const float * cur, const float * query, const float * stack, float * partial,
++        const int n_embd, const int n_q, const int n_blocks,
++        const int64_t cur_nb1, const int64_t q_nb1, const int64_t st_nb1, const int64_t st_nb2) {
++    constexpr int NV = MAXS * (INKLING_MIX_MAX_Q + 1);
++    const int c = blockIdx.x, t = blockIdx.y, n_chunks = gridDim.x;
++    const int n_states = n_blocks + 1;
++    const int e = c*INKLING_MIX_CHUNK + threadIdx.x;
++
++    __shared__ float red[INKLING_MIX_CHUNK / WARP_SIZE][NV];
++
++    float acc[NV];
++#pragma unroll
++    for (int k = 0; k < NV; ++k) {
++        acc[k] = 0.0f;
++    }
++    if (e < n_embd) {
++        float q[INKLING_MIX_MAX_Q];
++#pragma unroll
++        for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++            q[i] = i < n_q ? ((const float *) ((const char *) query + i*q_nb1))[e] : 0.0f;
++        }
++#pragma unroll
++        for (int j = 0; j < MAXS; ++j) {
++            if (j < n_states) {
++                const float * s = j < n_blocks ? (const float *) ((const char *) stack + j*st_nb1 + t*st_nb2)
++                                               : (const float *) ((const char *) cur + t*cur_nb1);
++                const float v = s[e];
++                acc[j*(INKLING_MIX_MAX_Q + 1)] = v*v;
++#pragma unroll
++                for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                    acc[j*(INKLING_MIX_MAX_Q + 1) + 1 + i] = v*q[i];
++                }
++            }
++        }
++    }
++    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
++#pragma unroll
++    for (int k = 0; k < NV; ++k) {
++        acc[k] = warp_reduce_sum(acc[k]);
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int k = 0; k < NV; ++k) {
++            red[warp][k] = acc[k];
++        }
++    }
++    __syncthreads();
++    for (int k = threadIdx.x; k < n_states*(INKLING_MIX_MAX_Q + 1); k += blockDim.x) {
++        float s = 0.0f;
++        for (int wi = 0; wi < INKLING_MIX_CHUNK / WARP_SIZE; ++wi) {
++            s += red[wi][k];
++        }
++        partial[((int64_t) t*n_chunks + c)*NV + k] = s;
++    }
++}
++
++template <int MAXS>
++static __global__ void inkling_mix_finish_f32(
++        const float * cur, const float * stack, const float * partial, float * dst,
++        const int n_embd, const int n_q, const int n_blocks,
++        const int64_t cur_nb1, const int64_t st_nb1, const int64_t st_nb2,
++        const int64_t d_nb1, const int64_t d_nb2, const float eps, const float scale) {
++    constexpr int NV = MAXS * (INKLING_MIX_MAX_Q + 1);
++    const int c = blockIdx.x, t = blockIdx.y, n_chunks = gridDim.x;
++    const int n_states = n_blocks + 1;
++
++    __shared__ float tot[NV];
++    __shared__ float w[INKLING_MIX_MAX_Q][MAXS];
++
++    for (int k = threadIdx.x; k < n_states*(INKLING_MIX_MAX_Q + 1); k += blockDim.x) {
++        float s = 0.0f;
++        for (int ci = 0; ci < n_chunks; ++ci) {
++            s += partial[((int64_t) t*n_chunks + ci)*NV + k];
++        }
++        tot[k] = s;
++    }
++    __syncthreads();
++    if (threadIdx.x < n_q) {
++        const int i = threadIdx.x;
++        float sc[MAXS], r[MAXS];
++        float max = -INFINITY;
++        for (int j = 0; j < n_states; ++j) {
++            r[j]  = rsqrtf(tot[j*(INKLING_MIX_MAX_Q + 1)] / n_embd + eps);
++            sc[j] = scale * r[j] * tot[j*(INKLING_MIX_MAX_Q + 1) + 1 + i];
++            max   = fmaxf(max, sc[j]);
++        }
++        float sum = 0.0f;
++        for (int j = 0; j < n_states; ++j) {
++            sc[j] = expf(sc[j] - max);
++            sum  += sc[j];
++        }
++        for (int j = 0; j < n_states; ++j) {
++            w[i][j] = sc[j] / sum * r[j];
++        }
++    }
++    __syncthreads();
++
++    const int e = c*INKLING_MIX_CHUNK + threadIdx.x;
++    if (e < n_embd) {
++        float o[INKLING_MIX_MAX_Q] = { 0.0f };
++#pragma unroll
++        for (int j = 0; j < MAXS; ++j) {
++            if (j < n_states) {
++                const float * s = j < n_blocks ? (const float *) ((const char *) stack + j*st_nb1 + t*st_nb2)
++                                               : (const float *) ((const char *) cur + t*cur_nb1);
++                const float v = s[e];
++#pragma unroll
++                for (int i = 0; i < INKLING_MIX_MAX_Q; ++i) {
++                    o[i] += w[i][j] * v;
++                }
++            }
++        }
++        for (int i = 0; i < n_q; ++i) {
++            ((float *) ((char *) dst + i*d_nb1 + t*d_nb2))[e] = o[i];
++        }
++    }
++}
++
++template <int MAXS>
++static void inkling_mix_split_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * cur, const ggml_tensor * query,
++                                   const ggml_tensor * stack, ggml_tensor * dst) {
++    constexpr int NV = MAXS * (INKLING_MIX_MAX_Q + 1);
++    const int n_embd = (int) cur->ne[0], n_tokens = (int) cur->ne[1];
++    const int n_chunks = (n_embd + INKLING_MIX_CHUNK - 1) / INKLING_MIX_CHUNK;
++    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) n_tokens*n_chunks*NV);
++    const dim3 grid(n_chunks, n_tokens, 1);
++    const float * st = stack ? (const float *) stack->data : nullptr;
++    inkling_mix_partial_f32<MAXS><<<grid, INKLING_MIX_CHUNK, 0, ctx.stream()>>>(
++        (const float *) cur->data, (const float *) query->data, st, partial.get(), n_embd, (int) query->ne[1],
++        stack ? (int) stack->ne[1] : 0, cur->nb[1], query->nb[1], stack ? stack->nb[1] : 0, stack ? stack->nb[2] : 0);
++    inkling_mix_finish_f32<MAXS><<<grid, INKLING_MIX_CHUNK, 0, ctx.stream()>>>(
++        (const float *) cur->data, st, partial.get(), (float *) dst->data, n_embd, (int) query->ne[1],
++        stack ? (int) stack->ne[1] : 0, cur->nb[1], stack ? stack->nb[1] : 0, stack ? stack->nb[2] : 0,
++        dst->nb[1], dst->nb[2], ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1));
++}
++
++bool ggml_cuda_inkling_mix_supported(const ggml_tensor * op) {
++    const ggml_tensor * cur = op->src[0], * query = op->src[1], * stack = op->src[2];
++    const int64_t n_states = (stack ? stack->ne[1] : 0) + 1;
++    return cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32 && (!stack || stack->type == GGML_TYPE_F32) &&
++           cur->nb[0] == sizeof(float) && query->nb[0] == sizeof(float) && (!stack || stack->nb[0] == sizeof(float)) &&
++           n_states <= INKLING_MIX_MAX_STATES && query->ne[1] <= INKLING_MIX_MAX_Q;
++}
++
++void ggml_cuda_op_inkling_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * cur = dst->src[0], * query = dst->src[1], * stack = dst->src[2];
++    GGML_ASSERT(ggml_cuda_inkling_mix_supported(dst));
++    GGML_ASSERT(dst->nb[0] == sizeof(float));
++    const int n_states = (stack ? (int) stack->ne[1] : 0) + 1;
++    // few tokens (decode): spread each token over n_embd/256 blocks
++    static const bool no_split = getenv("GGML_CUDA_INKLING_MIX_NO_SPLIT") != nullptr;
++    if (!no_split && cur->ne[1] < 16) {
++        if (n_states <= 8)  { inkling_mix_split_cuda<8>(ctx, cur, query, stack, dst);  return; }
++        if (n_states <= 16) { inkling_mix_split_cuda<16>(ctx, cur, query, stack, dst); return; }
++    }
++#define INKLING_MIX_FAST_ARGS \
++        (const float *) cur->data, (const float *) query->data, stack ? (const float *) stack->data : nullptr, (float *) dst->data, \
++        (int) cur->ne[0], (int) query->ne[1], stack ? (int) stack->ne[1] : 0, \
++        cur->nb[1], query->nb[1], stack ? stack->nb[1] : 0, stack ? stack->nb[2] : 0, \
++        dst->nb[1], dst->nb[2], ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1)
++    if (n_states <= 8) {
++        inkling_mix_fast_f32<8><<<(unsigned) cur->ne[1], INKLING_MIX_FAST_THREADS, 0, ctx.stream()>>>(INKLING_MIX_FAST_ARGS);
++        return;
++    }
++    if (n_states <= 16) {
++        inkling_mix_fast_f32<16><<<(unsigned) cur->ne[1], INKLING_MIX_FAST_THREADS, 0, ctx.stream()>>>(INKLING_MIX_FAST_ARGS);
++        return;
++    }
++#undef INKLING_MIX_FAST_ARGS
++    inkling_mix_f32<<<(unsigned) cur->ne[1], INKLING_MIX_THREADS, 0, ctx.stream()>>>(
++        (const float *) cur->data, (const float *) query->data, stack ? (const float *) stack->data : nullptr, (float *) dst->data,
++        (int) cur->ne[0], (int) query->ne[1], stack ? (int) stack->ne[1] : 0,
++        cur->nb[1], query->nb[1], stack ? stack->nb[1] : 0, stack ? stack->nb[2] : 0,
++        dst->nb[1], dst->nb[2], ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1));
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// control() gates. Unfused (after each gate matvec m):
++//   forget: TANH(m) -> MUL(tanh, X) -> SUB(X, mul)      out = X - tanh(m)*X
++//   gain:   TANH(m) -> MUL(tanh, M) -> ADD(Y, mul)      out = Y + tanh(m)*M
++// Fused: one elementwise kernel, same expressions (bit-identical).
++// ---------------------------------------------------------------------------------------------------------------------
++// 2-D tensors [ne0, ne1]; m and dst contiguous, other/base may have a row stride (views of the mix output)
++static __global__ void inkling_tanh_gate_f32(const float * m, const char * other, const char * base, float * dst,
++                                             const int64_t ne0, const int64_t n, const int64_t o_nb1, const int64_t b_nb1,
++                                             const bool is_sub) {
++    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t i0 = i % ne0, i1 = i / ne0;
++    const float o = *(const float *) (other + i1*o_nb1 + i0*sizeof(float));
++    const float b = *(const float *) (base  + i1*b_nb1 + i0*sizeof(float));
++    const float t = tanhf(m[i]) * o;
++    dst[i] = is_sub ? b - t : b + t;
++}
++
++int ggml_cuda_try_fuse_inkling_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * th = cgraph->nodes[i];
++    if (th->op != GGML_OP_UNARY || ggml_get_unary_op(th) != GGML_UNARY_OP_TANH || i + 2 >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * mul = cgraph->nodes[i + 1];
++    const ggml_tensor * fin = cgraph->nodes[i + 2];
++    if (mul->op != GGML_OP_MUL || (fin->op != GGML_OP_SUB && fin->op != GGML_OP_ADD)) {
++        return 0;
++    }
++    const enum ggml_op ops[3] = { GGML_OP_UNARY, GGML_OP_MUL, fin->op };
++    const int out_idx = i + 2;
++    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, &out_idx, 1)) {
++        return 0;
++    }
++    const ggml_tensor * other = mul->src[0] == th ? mul->src[1] : (mul->src[1] == th ? mul->src[0] : nullptr);
++    if (!other || fin->src[1] != mul) {
++        return 0;
++    }
++    const bool is_sub = fin->op == GGML_OP_SUB;
++    const ggml_tensor * base = fin->src[0];
++    if (is_sub && base != other) {    // forget gate: X - tanh(m)*X
++        return 0;
++    }
++    const ggml_tensor * m = th->src[0];
++    for (const ggml_tensor * t : { m, other, base, th, mul, fin }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, fin) || t->ne[2] != 1 || t->ne[3] != 1 ||
++            t->nb[0] != sizeof(float)) {
++            return 0;
++        }
++    }
++    if (!ggml_is_contiguous(m) || !ggml_is_contiguous(fin)) {   // other/base may be row-strided views
++        return 0;
++    }
++    // elementwise: an exact in-place alias is fine, partial overlap is not
++    for (const ggml_tensor * t : { m, other, base }) {
++        if (inkling_overlaps(fin, t) && !(fin->data == t->data && fin->nb[1] == t->nb[1])) {
++            return 0;
++        }
++    }
++    const int64_t n = ggml_nelements(fin);
++    const int block = 256;
++    inkling_tanh_gate_f32<<<(n + block - 1)/block, block, 0, ctx.stream()>>>(
++        (const float *) m->data, (const char *) other->data, (const char *) base->data, (float *) fin->data,
++        fin->ne[0], n, other->nb[1], base->nb[1], is_sub);
++    return 2;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// control() second half, fully fused. Unfused (8 nodes):
++//   MUL_MAT(Wf, d) -> TANH -> MUL(.., X) -> SUB(X, ..) -> MUL_MAT(Wg, d) -> TANH -> MUL(.., M) -> ADD(sub, ..)
++//   out = (X - tanh(Wf d)*X) + tanh(Wg d)*M,  Wf/Wg [rank, n_embd] f32, d [rank, T]
++// One warp per output element computes both rank-length dots (coalesced row reads, warp reduction) and both gates.
++// Not bit-exact vs the matvec kernels (different summation order).
++// ---------------------------------------------------------------------------------------------------------------------
++static __global__ void inkling_control_gates_f32(
++        const float * wf, const float * wg, const float * d, const char * x, const char * msg, float * dst,
++        const int rank, const int n_embd, const int n_tokens,
++        const int64_t wf_nb1, const int64_t wg_nb1, const int64_t d_nb1, const int64_t x_nb1, const int64_t m_nb1, const int64_t dst_nb1) {
++    const int warp = (blockIdx.x*blockDim.x + threadIdx.x) / WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++    if (warp >= n_embd*n_tokens) {
++        return;
++    }
++    const int e = warp % n_embd, t = warp / n_embd;
++    const float * rf = (const float *) ((const char *) wf + e*wf_nb1);
++    const float * rg = (const float *) ((const char *) wg + e*wg_nb1);
++    const float * dv = (const float *) ((const char *) d  + t*d_nb1);
++    float sf = 0.0f, sg = 0.0f;
++    for (int k = lane; k < rank; k += WARP_SIZE) {
++        const float dk = dv[k];
++        sf += rf[k] * dk;
++        sg += rg[k] * dk;
++    }
++    sf = warp_reduce_sum(sf);
++    sg = warp_reduce_sum(sg);
++    if (lane == 0) {
++        const float xv = *(const float *) (x   + t*x_nb1 + e*sizeof(float));
++        const float mv = *(const float *) (msg + t*m_nb1 + e*sizeof(float));
++        const float sub = xv - tanhf(sf) * xv;
++        ((float *) ((char *) dst + t*dst_nb1))[e] = sub + tanhf(sg) * mv;
++    }
++}
++
++int ggml_cuda_try_fuse_inkling_control_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const enum ggml_op ops[8] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
++                                         GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
++    const int out_idx = i + 7;
++    if (i + 7 >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, i, 8, ops, &out_idx, 1)) {
++        return 0;
++    }
++    const ggml_tensor * const * n = cgraph->nodes + i;
++    if (ggml_get_unary_op(n[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[5]) != GGML_UNARY_OP_TANH) {
++        return 0;
++    }
++    const ggml_tensor * mmf = n[0], * mmg = n[4], * sub = n[3], * add = n[7];
++    const ggml_tensor * d = mmf->src[1];
++    // data flow: tanh(mm), mul(tanh, X), sub(X, mul), tanh(mm2), mul(tanh2, M), add(sub, mul2), same d for both matmuls
++    if (n[1]->src[0] != mmf || n[5]->src[0] != mmg || mmg->src[1] != d) {
++        return 0;
++    }
++    const ggml_tensor * X = n[2]->src[0] == n[1] ? n[2]->src[1] : (n[2]->src[1] == n[1] ? n[2]->src[0] : nullptr);
++    const ggml_tensor * M = n[6]->src[0] == n[5] ? n[6]->src[1] : (n[6]->src[1] == n[5] ? n[6]->src[0] : nullptr);
++    if (!X || !M || sub->src[0] != X || sub->src[1] != n[2] || add->src[0] != sub || add->src[1] != n[6]) {
++        return 0;
++    }
++    const ggml_tensor * wf = mmf->src[0], * wg = mmg->src[0];
++    const int rank = (int) wf->ne[0], n_embd = (int) wf->ne[1], n_tokens = (int) d->ne[1];
++    // the kernel re-reads the weight rows per token: only a win for few tokens (decode); prompts keep the GEMM path
++    if (n_tokens > 8) {
++        return 0;
++    }
++    if (wf->type != GGML_TYPE_F32 || wg->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 || X->type != GGML_TYPE_F32 ||
++        M->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_are_same_shape(wf, wg) || d->ne[0] != rank ||
++        wf->nb[0] != sizeof(float) || wg->nb[0] != sizeof(float) || d->nb[0] != sizeof(float) || X->nb[0] != sizeof(float) ||
++        M->nb[0] != sizeof(float) || !ggml_is_contiguous(add) || X->ne[0] != n_embd || X->ne[1] != n_tokens ||
++        M->ne[0] != n_embd || M->ne[1] != n_tokens || d->ne[2] != 1 || X->ne[2] != 1 || M->ne[2] != 1 || wf->ne[2] != 1) {
++        return 0;
++    }
++    // each warp reads x, msg, d and writes one element: exact same-layout alias with x or msg is fine
++    for (const ggml_tensor * t : { X, M }) {
++        if (inkling_overlaps(add, t) && !(add->data == t->data && add->nb[1] == t->nb[1])) {
++            return 0;
++        }
++    }
++    if (inkling_overlaps(add, d) || inkling_overlaps(add, wf) || inkling_overlaps(add, wg)) {
++        return 0;
++    }
++    const int64_t n_warps = (int64_t) n_embd*n_tokens;
++    const int threads = 256;
++    const int64_t blocks = (n_warps*WARP_SIZE + threads - 1)/threads;
++    inkling_control_gates_f32<<<(unsigned) blocks, threads, 0, ctx.stream()>>>(
++        (const float *) wf->data, (const float *) wg->data, (const float *) d->data, (const char *) X->data, (const char *) M->data,
++        (float *) add->data, rank, n_embd, n_tokens, wf->nb[1], wg->nb[1], d->nb[1], X->nb[1], M->nb[1], add->nb[1]);
++    return 7;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// convolve() head. Unfused: x = CONCAT(past, cur^T, dim 0) -> [views] -> CPY(view(x, last n_cols columns), state cell).
++// Fused: one kernel writes x and the state cell (pure copies, bit-identical).
++// ---------------------------------------------------------------------------------------------------------------------
++static __global__ void inkling_concat_state_f32(
++        const char * src0, const char * src1, char * dst, char * cell,
++        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2,
++        const size_t s0_nb0, const size_t s0_nb1, const size_t s0_nb2,
++        const size_t s1_nb0, const size_t s1_nb1, const size_t s1_nb2,
++        const size_t d_nb1, const size_t d_nb2,
++        const int64_t first_col, const int64_t n_cols, const int64_t cell_ne0, const size_t cell_nb1) {
++    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (i >= ne0*ne1*ne2) {
++        return;
++    }
++    const int64_t i0 = i % ne0;
++    const int64_t i1 = (i / ne0) % ne1;
++    const int64_t i2 = i / (ne0*ne1);
++
++    const float v = i0 < ne00
++        ? *(const float *) (src0 + i0*s0_nb0 + i1*s0_nb1 + i2*s0_nb2)
++        : *(const float *) (src1 + (i0 - ne00)*s1_nb0 + i1*s1_nb1 + i2*s1_nb2);
++
++    *(float *) (dst + i0*sizeof(float) + i1*d_nb1 + i2*d_nb2) = v;
++
++    if (i0 >= first_col) {
++        // flat index in the copied view [n_cols, ne1, ne2], laid out into the 2-D cell [cell_ne0, n_seqs]
++        const int64_t e = (i0 - first_col) + n_cols*(i1 + ne1*i2);
++        *(float *) (cell + (e % cell_ne0)*sizeof(float) + (e / cell_ne0)*cell_nb1) = v;
++    }
++}
++
++// TEMP debug: INKLING_FUSE_DEBUG=1 prints why the concat/state matcher rejects (first 12 per process)
++static int inkling_reject(const ggml_cgraph * cgraph, int i, const char * why) {
++    static const bool dbg = getenv("INKLING_FUSE_DEBUG") != nullptr;
++    static int n = 0;
++    if (dbg && n < 12) {
++        n++;
++        fprintf(stderr, "inkling concat/state reject @%d: %s | next ops:", i, why);
++        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 5; ++j) {
++            fprintf(stderr, " %s(%s)", ggml_op_name(cgraph->nodes[j]->op), cgraph->nodes[j]->name);
++        }
++        fprintf(stderr, "\n");
++    }
++    return 0;
++}
++
++int ggml_cuda_try_fuse_inkling_concat_state(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * cat = cgraph->nodes[i];
++    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32) {
++        return 0;
++    }
++    // walk over view nodes to the CPY
++    int k = i + 1;
++    while (k < cgraph->n_nodes && k <= i + 4 && inkling_is_view_op(cgraph->nodes[k]->op)) {
++        k++;
++    }
++    if (k >= cgraph->n_nodes || k > i + 4) {
++        return inkling_reject(cgraph, i, "no CPY within 4 views");
++    }
++    const ggml_tensor * cpy  = cgraph->nodes[k];
++    if (cpy->op != GGML_OP_CPY) {
++        return inkling_reject(cgraph, i, "node after views is not CPY");
++    }
++    const ggml_tensor * last = cpy->src[0];
++    const ggml_tensor * cell = cpy->src[1];
++    if (last->view_src != cat || last->op != GGML_OP_VIEW || cpy->type != GGML_TYPE_F32 || cell->type != GGML_TYPE_F32 ||
++        cat->src[0]->type != GGML_TYPE_F32 || cat->src[1]->type != GGML_TYPE_F32) {
++        return inkling_reject(cgraph, i, "CPY src is not a VIEW of the CONCAT / types");
++    }
++    // every node between CONCAT and CPY must be a view that nothing outside reads at execution time (views have no kernels)
++    enum ggml_op ops[8];
++    for (int j = i; j <= k; ++j) {
++        ops[j - i] = cgraph->nodes[j]->op;
++    }
++    // outputs: x (CONCAT, read later by ssm_conv), the CPY, and the state-cell view (the CPY destination, a view of the
++    // persistent conv state outside the subgraph: we write through it, so it is an output, not an elided intermediate)
++    int outs[8] = { i, k };
++    int n_outs  = 2;
++    for (int j = i + 1; j < k; ++j) {
++        if (cgraph->nodes[j] == cell) {
++            outs[n_outs++] = j;
++        }
++    }
++    if (!ggml_can_fuse_subgraph(cgraph, i, k - i + 1, ops, outs, n_outs)) {
++        return inkling_reject(cgraph, i, "ggml_can_fuse_subgraph");
++    }
++    // `last` must be the trailing columns of a contiguous x, cell a 2-D view with contiguous rows
++    if (!ggml_is_contiguous(cat) || last->nb[1] != cat->nb[1] || last->nb[2] != cat->nb[2] ||
++        last->ne[1] != cat->ne[1] || last->ne[2] != cat->ne[2] || cell->nb[0] != sizeof(float) ||
++        ggml_nelements(cell) != ggml_nelements(last) || cell->ne[2] != 1 || cell->ne[3] != 1 || cat->ne[3] != 1) {
++        return inkling_reject(cgraph, i, "layout");
++    }
++    const int64_t first_col = last->view_offs / sizeof(float);
++    if (first_col * (int64_t) sizeof(float) != (int64_t) last->view_offs || first_col + last->ne[0] != cat->ne[0]) {
++        return inkling_reject(cgraph, i, "view offset");
++    }
++    // the cell (persistent state) must not overlap what the kernel reads
++    if (inkling_overlaps(cell, cat->src[0]) || inkling_overlaps(cell, cat->src[1]) ||
++        inkling_overlaps(cat, cat->src[0]) || inkling_overlaps(cat, cat->src[1])) {
++        return inkling_reject(cgraph, i, "overlap");
++    }
++
++    const ggml_tensor * s0 = cat->src[0];
++    const ggml_tensor * s1 = cat->src[1];
++    const int64_t n = ggml_nelements(cat);
++    const int block = 256;
++    inkling_concat_state_f32<<<(n + block - 1)/block, block, 0, ctx.stream()>>>(
++        (const char *) s0->data, (const char *) s1->data, (char *) cat->data, (char *) cell->data,
++        s0->ne[0], cat->ne[0], cat->ne[1], cat->ne[2],
++        s0->nb[0], s0->nb[1], s0->nb[2], s1->nb[0], s1->nb[1], s1->nb[2],
++        cat->nb[1], cat->nb[2], first_col, last->ne[0], cell->ne[0], cell->nb[1]);
++    return k - i;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// convolve() tail. Unfused: SSM_CONV -> RESHAPE -> ADD(res, conv) -> SCALE(s, b).
++// Fused: the ssm_conv kernel with an epilogue y = s*(res + conv) + b (same expressions, so bit-identical).
++// ---------------------------------------------------------------------------------------------------------------------
++int ggml_cuda_try_fuse_inkling_conv(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const enum ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
++    const int out_idx = i + 3;
++    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, &out_idx, 1)) {
++        return 0;
++    }
++    const ggml_tensor * conv = cgraph->nodes[i];
++    const ggml_tensor * resh = cgraph->nodes[i + 1];
++    const ggml_tensor * add  = cgraph->nodes[i + 2];
++    const ggml_tensor * scl  = cgraph->nodes[i + 3];
++
++    if (resh->src[0] != conv || scl->src[0] != add) {
++        return 0;
++    }
++    const ggml_tensor * res = add->src[1] == resh ? add->src[0] : (add->src[0] == resh ? add->src[1] : nullptr);
++    if (!res || !ggml_are_same_shape(res, resh) || !ggml_are_same_shape(add, scl)) {
++        return 0;
++    }
++    if (conv->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || scl->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(conv) || !ggml_is_contiguous(res) || !ggml_is_contiguous(scl) ||
++        conv->src[0]->ne[1] % 128 != 0) {
++        return 0;
++    }
++    // reads conv input/weights and res while writing scl: exact in-place over res is fine (read then write per element)
++    if (inkling_overlaps(scl, conv->src[0]) || inkling_overlaps(scl, conv->src[1]) ||
++        (inkling_overlaps(scl, res) && scl->data != res->data)) {
++        return 0;
++    }
++
++    // optional trailing residual ADD (attention / FFN output joining the residual stream): 5 nodes -> 1 kernel
++    static const enum ggml_op ops5[] = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
++    const int out5 = i + 4;
++    if (i + 4 < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, 5, ops5, &out5, 1)) {
++        const ggml_tensor * add2 = cgraph->nodes[i + 4];
++        const ggml_tensor * res2 = add2->src[1] == scl ? add2->src[0] : (add2->src[0] == scl ? add2->src[1] : nullptr);
++        if (res2 && res2->type == GGML_TYPE_F32 && add2->type == GGML_TYPE_F32 && ggml_is_contiguous(res2) &&
++            ggml_is_contiguous(add2) && ggml_are_same_shape(res2, scl) && ggml_are_same_shape(add2, scl) &&
++            !inkling_overlaps(add2, conv->src[0]) && !inkling_overlaps(add2, conv->src[1]) &&
++            !(inkling_overlaps(add2, res) && add2->data != res->data) &&
++            !(inkling_overlaps(add2, res2) && add2->data != res2->data)) {
++            ggml_cuda_op_ssm_conv_res_scale(ctx, conv, res, add2, ggml_get_op_params_f32(scl, 0), ggml_get_op_params_f32(scl, 1), res2);
++            return 4;
++        }
++    }
++
++    ggml_cuda_op_ssm_conv_res_scale(ctx, conv, res, scl, ggml_get_op_params_f32(scl, 0), ggml_get_op_params_f32(scl, 1));
++    return 3;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// L2 row clip
++//
++// Unfused graph (per row of ne0 elements, scale broadcast over rows of dims 2/3):
++//   [MUL(x, scale)] -> SQR -> SUM_ROWS -> SQRT -> SCALE(s, b) -> FILL(threshold) -> DIV(fill, scaled) -> CLAMP(lo, hi) -> MUL(y, clamp)
++//
++// The kernel reproduces every op's float expression and the SUM_ROWS reduction order (reduce_row_f32: 8-way strided
++// partial sums per thread, then block_reduce, same block size selection as sum_rows_f32_cuda) so the output is
++// bit-identical to the unfused graph.
++// ---------------------------------------------------------------------------------------------------------------------
++
++// (has_scale is a runtime flag, not a template parameter: nvcc+MSVC fail on templated kernels with restrict params)
++static __global__ void inkling_clip_f32(
++        const float * x, const float * scale, float * dst, const bool has_scale,
++        const int ncols, const int64_t scale_rows,
++        const float s, const float b, const float threshold, const float lo, const float hi) {
++    const int64_t row = blockIdx.x;
++    const int     col = threadIdx.x;
++
++    const float * xr = x   + row*ncols;
++    float       * dr = dst + row*ncols;
++    // the scale tensor is [ncols, scale_rows] and broadcasts over the higher dims of x
++    const float * sr = has_scale ? scale + (row % scale_rows)*ncols : nullptr;
++
++    // --- identical to reduce_row_f32, with the input element computed as SQR(MUL(x, scale)) ---
++    float     sum        = 0.0f;
++    const int num_unroll = 8;
++    float     temp[num_unroll];
++    float     sum_temp[num_unroll] = { 0.0f };
++
++    ggml_cuda_pdl_sync();
++    for (int i = col; i < ncols;) {
++        for (int j = 0; j < num_unroll; ++j) {
++            if (i < ncols) {
++                const float y = has_scale ? xr[i] * sr[i] : xr[i];
++                temp[j] = y * y;
++            } else {
++                temp[j] = 0;
++            }
++            i += blockDim.x;
++        }
++        for (int j = 0; j < num_unroll; ++j) {
++            sum_temp[j] += temp[j];
++        }
++    }
++    for (int j = 0; j < num_unroll; ++j) {
++        sum += sum_temp[j];
++    }
++
++    __shared__ float shared_vals[32];
++    sum = block_reduce<block_reduce_method::SUM>(sum, shared_vals);   // every thread gets the row sum
++
++    // --- SQRT, SCALE, FILL/DIV, CLAMP: same expressions as the unfused kernels ---
++    const float norm   = sqrtf(sum);
++    const float scaled = s * norm + b;
++    const float factor = fminf(fmaxf(threshold / scaled, lo), hi);
++
++    // --- final MUL(y, factor) ---
++    for (int i = col; i < ncols; i += blockDim.x) {
++        const float y = has_scale ? xr[i] * sr[i] : xr[i];
++        dr[i] = y * factor;
++    }
++}
++
++int ggml_cuda_try_fuse_inkling_clip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const enum ggml_op ops_scaled[]   = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
++                                                 GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
++    static const enum ggml_op ops_unscaled[] = { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
++                                                 GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
++
++    const ggml_tensor * first = cgraph->nodes[i];
++    bool has_scale;
++    if (first->op == GGML_OP_MUL) {
++        has_scale = true;
++    } else if (first->op == GGML_OP_SQR) {
++        has_scale = false;
++    } else {
++        return 0;
++    }
++
++    const int             n_ops = has_scale ? 9 : 8;
++    const enum ggml_op  * ops   = has_scale ? ops_scaled : ops_unscaled;
++    const int             out   = i + n_ops - 1;
++
++    // op types in order, intermediates used only inside the chain
++    if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, &out, 1)) {
++        return 0;
++    }
++
++    const int o = has_scale ? 1 : 0;   // offset of SQR
++    const ggml_tensor * mul0  = has_scale ? cgraph->nodes[i] : nullptr;
++    const ggml_tensor * sqr   = cgraph->nodes[i + o + 0];
++    const ggml_tensor * sum   = cgraph->nodes[i + o + 1];
++    const ggml_tensor * sqrt_ = cgraph->nodes[i + o + 2];
++    const ggml_tensor * scl   = cgraph->nodes[i + o + 3];
++    const ggml_tensor * fill  = cgraph->nodes[i + o + 4];
++    const ggml_tensor * div   = cgraph->nodes[i + o + 5];
++    const ggml_tensor * clamp = cgraph->nodes[i + o + 6];
++    const ggml_tensor * mul1  = cgraph->nodes[i + o + 7];
++
++    // y is the MUL output (scaled) or the raw input (unscaled)
++    const ggml_tensor * y = has_scale ? mul0 : sqr->src[0];
++
++    // exact data flow of clip()
++    if (sqr->src[0] != y || sum->src[0] != sqr || sqrt_->src[0] != sum || scl->src[0] != sqrt_ ||
++        fill->src[0] != scl || div->src[0] != fill || div->src[1] != scl || clamp->src[0] != div ||
++        mul1->src[0] != y || mul1->src[1] != clamp) {
++        return 0;
++    }
++
++    const ggml_tensor * x     = has_scale ? mul0->src[0] : y;
++    const ggml_tensor * scale = has_scale ? mul0->src[1] : nullptr;
++
++    // f32, contiguous rows, and a scale that broadcasts only over dims 2 and 3
++    for (const ggml_tensor * t : { x, mul1, sqr }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
++            return 0;
++        }
++    }
++    if (!ggml_are_same_shape(x, mul1) || sum->ne[0] != 1) {
++        return 0;
++    }
++    if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != x->ne[0] ||
++                  scale->ne[1] != x->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1)) {
++        return 0;
++    }
++
++    // the kernel reads x (and scale) while writing the output: an exact in-place alias is safe (each thread reads element
++    // i before writing it), any other overlap is not
++    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * c) {
++        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
++        const char * c0 = (const char *) c->data; const char * c1 = c0 + ggml_nbytes(c);
++        return a0 < c1 && c0 < a1;
++    };
++    if ((overlaps(mul1, x) && mul1->data != x->data) || (scale && overlaps(mul1, scale))) {
++        return 0;
++    }
++
++    const int     ncols = (int) x->ne[0];
++    const int64_t nrows = ggml_nrows(x);
++
++    const float s         = ggml_get_op_params_f32(scl, 0);
++    const float b         = ggml_get_op_params_f32(scl, 1);
++    const float threshold = ggml_get_op_params_f32(fill, 0);
++    const float lo        = ggml_get_op_params_f32(clamp, 0);
++    const float hi        = ggml_get_op_params_f32(clamp, 1);
++
++    // same block size as sum_rows_f32_cuda, so the reduction tree (and the result) is identical
++    const int  nsm        = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    const dim3 block_dims((nrows / nsm) < 2 ? 512 : (ncols < 1024 ? 32 : 128), 1, 1);
++    const dim3 block_nums((unsigned) nrows, 1, 1);
++
++    cudaStream_t stream = ctx.stream();
++    inkling_clip_f32<<<block_nums, block_dims, 0, stream>>>(
++        (const float *) x->data, has_scale ? (const float *) scale->data : nullptr, (float *) mul1->data, has_scale,
++        ncols, has_scale ? x->ne[1] : 1, s, b, threshold, lo, hi);
++
++    return n_ops - 1;
++}
+diff --git a/ggml/src/ggml-cuda/inkling-fused.cuh b/ggml/src/ggml-cuda/inkling-fused.cuh
+new file mode 100644
+index 000000000..3b084db93
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-fused.cuh
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include "common.cuh"
++
++// Inkling 2 fused ops (inkling-fusion branch)
++
++// L2 row clip, the 8- or 9-node chain built by llama_model_inkling2::graph::clip():
++//   y = scale ? x*scale : x;  n = s*sqrt(sum_rows(y*y)) + b;  out = y * clamp(threshold/n, lo, hi)
++// Returns the number of extra graph nodes consumed (0 = no match).
++int ggml_cuda_try_fuse_inkling_clip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++
++// GGML_OP_INKLING_MIX (depth attention) kernel
++bool ggml_cuda_inkling_mix_supported(const ggml_tensor * op);
++void ggml_cuda_op_inkling_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// control() gates: TANH -> MUL -> SUB (forget) / ADD (gain)  =>  one elementwise kernel
++int ggml_cuda_try_fuse_inkling_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++
++// control() second half: MUL_MAT(f) TANH MUL SUB MUL_MAT(g) TANH MUL ADD  =>  one warp-per-output kernel (not bit-exact)
++int ggml_cuda_try_fuse_inkling_control_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++
++// convolve() head: CONCAT(past, cur^T) -> [views] -> CPY(last columns -> conv state)  =>  one kernel writing both
++int ggml_cuda_try_fuse_inkling_concat_state(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++
++// convolve() tail: SSM_CONV -> RESHAPE -> ADD(residual) -> SCALE  =>  one ssm_conv launch with a residual/scale epilogue
++int ggml_cuda_try_fuse_inkling_conv(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 0e77a3b22..57d2c39c2 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -2,12 +2,26 @@
+ #include "ssm-conv.cuh"
+ #include "unary.cuh"
+ 
++// optional epilogue (Inkling 2 convolve): y = res_scale*(res + conv) + res_bias, res has the same layout as dst
++struct ssm_conv_res_epilogue {
++    const float * res   = nullptr;
++    float         scale = 1.0f;
++    float         bias  = 0.0f;
++    const float * res2  = nullptr;   // optional trailing residual: y = res2 + (scale*(res + conv) + bias)
++};
++
++static __device__ __forceinline__ float ssm_conv_apply_res(const ssm_conv_res_epilogue & ep, const float conv, const int64_t idx) {
++    // same expressions as the unfused ADD (a + b) and SCALE (scale*x + bias) kernels
++    const float y = ep.scale * (ep.res[idx] + conv) + ep.bias;
++    return ep.res2 ? ep.res2[idx] + y : y;
++}
++
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
+                                     const float * bias_ptr,
+                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
+-                                    const int64_t n_t) {
++                                    const int64_t n_t, const ssm_conv_res_epilogue ep) {
+     ggml_cuda_pdl_lc();
+     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
+     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
+@@ -53,7 +67,8 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
+             sumf += x[(i + j) % d_conv] * w[j];
+         }
+         sumf += b;
+-        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
++        const int64_t yi = (y_block - dst) + i * stride_y + tid;
++        y_block[i * stride_y + tid] = ep.res ? ssm_conv_apply_res(ep, sumf, yi) : (apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf);
+     }
+ }
+ 
+@@ -62,7 +77,8 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0,
+                                                const float * __restrict__ bias,
+                                                const int src0_nb0, const int src0_nb1, const int src0_nb2,
+                                                const int src1_nb1, float * __restrict__ dst, const int dst_nb0,
+-                                               const int dst_nb1, const int dst_nb2, const int64_t n_t) {
++                                               const int dst_nb1, const int dst_nb2, const int64_t n_t,
++                                               const ssm_conv_res_epilogue ep) {
+     const int tid  = threadIdx.x;
+     const int bidx = blockIdx.x;
+     const int bidy = blockIdx.y;
+@@ -119,7 +135,8 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0,
+             sumf += smem[tid * n_cols + i + j] * w[j];
+         }
+         sumf += b;
+-        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
++        const int64_t yi = (y_block - dst) + i * stride_y + tid;
++        y_block[i * stride_y + tid] = ep.res ? ssm_conv_apply_res(ep, sumf, yi) : (apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf);
+     }
+ }
+ 
+@@ -127,7 +144,7 @@ template <bool apply_silu>
+ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
+                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
+                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
+-                              const int64_t n_s, cudaStream_t stream) {
++                              const int64_t n_s, cudaStream_t stream, const ssm_conv_res_epilogue ep = {}) {
+     const int threads = 128;
+     GGML_ASSERT(nr % threads == 0);
+ 
+@@ -137,13 +154,13 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
+-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
++                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, ep);
+         } else {
+             const int64_t split_n_t = 32;
+             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
+             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
+             ssm_conv_long_token_f32<apply_silu, threads, kNC, split_n_t><<<blocks, threads, smem_size, stream>>>(
+-                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
++                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, ep);
+         }
+     };
+ 
+@@ -159,6 +176,38 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+     }
+ }
+ 
++// Inkling 2 convolve tail: SSM_CONV -> (RESHAPE) -> ADD(res, conv) -> SCALE fused; out = scale node
++void ggml_cuda_op_ssm_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, const ggml_tensor * res,
++                                     const ggml_tensor * out, const float scale, const float bias, const ggml_tensor * res2) {
++    const ggml_tensor * src0 = conv->src[0];
++    const ggml_tensor * src1 = conv->src[1];
++
++    const int64_t nc  = src1->ne[0];
++    const int64_t nr  = src0->ne[1];
++    const int64_t n_t = conv->ne[1];
++    const int64_t n_s = conv->ne[2];
++
++    GGML_ASSERT(conv->ne[0] == nr);
++    GGML_ASSERT(src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float));
++    GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(conv) && ggml_is_contiguous(out) && ggml_is_contiguous(res));
++    GGML_ASSERT(ggml_nelements(out) == ggml_nelements(conv) && ggml_nelements(res) == ggml_nelements(conv));
++
++    ssm_conv_res_epilogue ep;
++    ep.res   = (const float *) res->data;
++    ep.scale = scale;
++    ep.bias  = bias;
++    if (res2) {
++        GGML_ASSERT(res2->type == GGML_TYPE_F32 && ggml_is_contiguous(res2) && ggml_nelements(res2) == ggml_nelements(conv));
++        ep.res2 = (const float *) res2->data;
++    }
++
++    // out has the contiguous layout of conv, so conv's strides index it
++    ssm_conv_f32_cuda<false>((const float *) src0->data, (const float *) src1->data, nullptr, src0->nb[0], src0->nb[1], src0->nb[2],
++                             src1->nb[1], (float *) out->data, conv->nb[0], conv->nb[1], conv->nb[2], nc, nr, n_t, n_s, ctx.stream(), ep);
++}
++
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..a8f6b592e 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,7 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// out = scale*(res + ssm_conv(conv)) + bias, written to out (contiguous, same element count as conv)
++void ggml_cuda_op_ssm_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, const ggml_tensor * res,
++                                     const ggml_tensor * out, float scale, float bias, const ggml_tensor * res2 = nullptr);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index b3b6aa48d..d2b75d29c 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -480,6 +480,72 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
+ }
+ 
++// situ (Inkling 2): beta*tanh(x/beta)*sigmoid(x) * (lb > 0 ? lb*tanh(g/lb) : g)
++// one kernel instead of 9 (scale, tanh, scale, sigmoid, mul, scale, tanh, scale, mul); same op order as the unfused
++// graph, and 1/beta, 1/lb are computed on the host like ggml_scale's factors, so results match the unfused graph
++
++static __global__ void situ_kernel(const float * x, const float * g, float * dst, const int64_t k, const int64_t n,
++        const int64_t o0, const int64_t o1, const float beta, const float inv_beta, const float lb, const float inv_lb) {
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t j0 = (i / n) * o0 + (i % n);
++    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
++
++    const float xi  = x[j0];
++    const float gi  = g[j1];
++    const float act = (tanhf(xi*inv_beta)*beta) * (1.0f/(1.0f + expf(-xi)));
++    const float up  = lb > 0.0f ? tanhf(gi*inv_lb)*lb : gi;
++
++    dst[i] = act*up;
++}
++
++void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    void * src0_d = src0->data;
++    void * src1_d = src1 ? src1->data : src0->data;
++    const int64_t src0_o = src0->nb[1];
++    const int64_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
++    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(ggml_is_contiguous_1(src0));
++    GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
++
++    if (src1) {
++        GGML_ASSERT(ggml_is_contiguous_1(src1));
++        GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
++        GGML_ASSERT(src1->ne[0] == nc);
++        GGML_ASSERT(src0->type == src1->type);
++    }
++
++    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
++    const float   beta    = ggml_get_op_params_f32(dst, 2);
++    const float   lb      = ggml_get_op_params_f32(dst, 3);
++
++    float * src0_p = (float *) src0_d;
++    float * src1_p = (float *) src1_d;
++
++    if (!src1) {
++        src0_p += swapped ? nc : 0;
++        src1_p += swapped ? 0 : nc;
++    }
++
++    const int64_t k          = ggml_nelements(dst);
++    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++    situ_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(src0_p, src1_p, (float *) dst->data, k, nc,
++            src0_o / sizeof(float), src1_o / sizeof(float), beta, 1.0f/beta, lb, lb > 0.0f ? 1.0f/lb : 0.0f);
++}
++
+ // swiglu_clamp
+ 
+ template <typename T>
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index c6ffdb9d6..a06bf3052 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -85,6 +85,8 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ 
+ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index b47c5addf..482fb41cb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1116,9 +1116,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ 
+     "SLEEP",
++
++    "INKLING_MIX",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
++static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1231,9 +1233,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ 
+     "sleep(x)",
++
++    "inkling_mix(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
++static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -1272,9 +1276,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
+     "GEGLU_ERF",
+     "GEGLU_QUICK",
+     "SWIGLU_CLAMP",
++    "SITU",
+ };
+ 
+-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
++static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
+ 
+ static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
+ static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
+@@ -3115,6 +3120,49 @@ struct ggml_tensor * ggml_swiglu_oai(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_inkling_mix(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * stack,
++        struct ggml_tensor  * cur,
++        struct ggml_tensor  * query,
++        float                 eps,
++        float                 scale) {
++    const int64_t n_embd   = cur->ne[0];
++    const int64_t n_tokens = cur->ne[1];
++    GGML_ASSERT(cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32);
++    GGML_ASSERT(cur->ne[2] == 1 && cur->ne[3] == 1);
++    GGML_ASSERT(query->ne[0] == n_embd && query->ne[2] == 1 && query->ne[3] == 1);
++    if (stack) {
++        GGML_ASSERT(stack->type == GGML_TYPE_F32);
++        GGML_ASSERT(stack->ne[0] == n_embd && stack->ne[2] == n_tokens && stack->ne[3] == 1);
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens);
++    ggml_set_op_params_f32(result, 0, eps);
++    ggml_set_op_params_f32(result, 1, scale);
++
++    result->op     = GGML_OP_INKLING_MIX;
++    result->src[0] = cur;
++    result->src[1] = query;
++    result->src[2] = stack;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_situ(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        float                 beta,
++        float                 linear_beta) {
++    GGML_ASSERT(beta > 0.0f);
++    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
++    ggml_set_op_params_f32(result, 2, beta);
++    ggml_set_op_params_f32(result, 3, linear_beta);
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_swiglu_clamp(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c5c9ddf01..5496dc537 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2671,12 +2671,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     const float beta = hparams.situ_beta;
+                     const float lb   = hparams.situ_linear_beta;
+ 
+-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+-                    if (lb > 0.0f) {
+-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
++                    // TEMP (inkling-fusion branch): LLAMA_INKLING_UNFUSED=1 restores the 9-op graph for A/B and equivalence checks
++                    static const bool unfused = getenv("LLAMA_INKLING_UNFUSED") != nullptr;
++                    if (unfused) {
++                        ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
++                        act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
++                        if (lb > 0.0f) {
++                            up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
++                        }
++                        cur = ggml_mul(ctx0, act, up);
++                    } else {
++                        cur = ggml_situ(ctx0, cur, up, beta, lb);
+                     }
+-                    cur = ggml_mul(ctx0, act, up);
+                     cb(cur, "ffn_moe_situ", il);
+                 } break;
+             case LLM_FFN_GELU:
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index e035d1a7b..13974a9df 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -175,14 +175,48 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
+ }
+ 
+ // attention over the depth: mix the earlier block outputs and cur with learned queries
++ggml_tensor * llama_model_inkling2::graph::stacked(const std::vector<ggml_tensor *> & blocks) {
++    if (blocks.empty()) {
++        return nullptr;
++    }
++    auto it = stack_cache.find(blocks);
++    if (it != stack_cache.end()) {
++        return it->second;
++    }
++    ggml_tensor * last   = ggml_reshape_3d(ctx0, blocks.back(), n_embd, 1, n_tokens);
++    ggml_tensor * prefix = stacked(std::vector<ggml_tensor *>(blocks.begin(), blocks.end() - 1));
++    ggml_tensor * stack  = prefix ? ggml_concat(ctx0, last, prefix, 1) : last;
++    stack_cache[blocks] = stack;
++    return stack;
++}
++
+ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
++    // TEMP (inkling-fusion branch): LLAMA_INKLING_UNFUSED=1 restores the original graph for A/B and equivalence checks
++    static const bool unfused = getenv("LLAMA_INKLING_UNFUSED") != nullptr;
++
++    // fused depth attention (one op instead of concat/rms_norm/repeat/transpose/2 matmuls/softmax). Not bit-exact
++    // (different reduction order than the matmuls); LLAMA_INKLING_NO_MIXOP=1 keeps the exact graph below
++    static const bool no_mixop = getenv("LLAMA_INKLING_NO_MIXOP") != nullptr;
++    if (!unfused && !no_mixop && cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32 &&
++            cur->ne[2] == 1 && cur->nb[0] == sizeof(float)) {
++        return ggml_inkling_mix(ctx0, stacked(blocks), cur, query, 1e-6f, 1.0f/sqrtf(n_embd));
++    }
++
+     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+-    for (ggml_tensor * block : blocks) {
+-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
++    if (unfused) {
++        for (ggml_tensor * block : blocks) {
++            states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
++        }
++    } else if (ggml_tensor * stack = stacked(blocks)) {
++        // same order as the loop above: [b_{n-1}, ..., b_0, cur]
++        states = ggml_concat(ctx0, stack, states, 1);
+     }
+     states = ggml_rms_norm(ctx0, states, 1e-6f);
+ 
+-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
++    // a single token needs no copy of the query per token
++    ggml_tensor * queries = !unfused && n_tokens == 1 && query->type == GGML_TYPE_F32 && ggml_is_contiguous(query)
++        ? ggml_reshape_3d(ctx0, query, n_embd, query->ne[1], 1)
++        : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+ 
+     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+@@ -238,7 +272,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ 
+ // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
++    // [cur; message] stacked on dim 1, row-normalized, then viewed as [2*n_embd, n_tokens]: the same memory as
++    // concat(rms(cur), rms(message), 0) (each row normalized independently), with one kernel less
++    static const bool unfused = getenv("LLAMA_INKLING_UNFUSED") != nullptr;
++    ggml_tensor * gate = unfused
++        ? ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0)
++        : ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, ggml_concat(ctx0,
++                  ggml_view_3d(ctx0, cur,     n_embd, 1, n_tokens, cur->nb[1],     cur->nb[1],     0),
++                  ggml_view_3d(ctx0, message, n_embd, 1, n_tokens, message->nb[1], message->nb[1], 0), 1), 1e-6f),
++                  2*n_embd, n_tokens);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
+     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
+@@ -284,7 +326,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // the message of controller ctrl, [n_embd, n_tokens]
+     auto message = [&](int ctrl) {
+-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
++        ggml_tensor * v = ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]);
++        // the consumers (rms_norm, mul) read strided rows, so the copy is only kept for the A/B switch
++        static const bool unfused = getenv("LLAMA_INKLING_UNFUSED") != nullptr;
++        return unfused ? ggml_cont(ctx0, v) : v;
+     };
+ 
+     ggml_tensor * state   = recr->mctx->get_r_l(il);
+@@ -297,8 +342,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     ggml_tensor * inputs[3] = {cur, cur, cur};
+     if (layer.attn_res_query) {
+         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
++        // consumers (control: rms_norm/mul/concat; build_norm: rms_norm+mul) read strided rows, so no copy is needed
++        static const bool unfused = getenv("LLAMA_INKLING_UNFUSED") != nullptr;
+         for (int j = 0; j < 3; ++j) {
+-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
++            ggml_tensor * v = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]);
++            inputs[j] = unfused ? ggml_cont(ctx0, v) : v;
+         }
+     }
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index 9b045d101..9ff9f2140 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2516,6 +2516,9 @@ struct llama_model_inkling2 : public llama_model_base {
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
++        // [b_{n-1}, ..., b_0] stacked along dim 1, built once per distinct prefix (mix() used to re-concat every block per call)
++        ggml_tensor * stacked(const std::vector<ggml_tensor *> & blocks);
++        std::map<std::vector<ggml_tensor *>, ggml_tensor *> stack_cache;
+         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+         ggml_tensor * convolve(
+                 ggml_tensor * cur,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 11bfa42a9..41edf9ab9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2366,6 +2366,87 @@ struct test_glu_split : public test_case {
+     }
+ };
+ 
++// GGML_OP_INKLING_MIX (Inkling 2 depth attention)
++struct test_inkling_mix : public test_case {
++    const int64_t n_embd, n_blocks, n_q, n_tokens;
++
++    std::string vars() override {
++        return VARS_TO_STR4(n_embd, n_blocks, n_q, n_tokens);
++    }
++
++    test_inkling_mix(int64_t n_embd = 2304, int64_t n_blocks = 3, int64_t n_q = 1, int64_t n_tokens = 1)
++        : n_embd(n_embd), n_blocks(n_blocks), n_q(n_q), n_tokens(n_tokens) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
++        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
++        ggml_tensor * stack = n_blocks ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_blocks, n_tokens) : nullptr;
++        ggml_set_name(cur, "cur");
++        ggml_set_name(query, "query");
++        if (stack) {
++            ggml_set_name(stack, "stack");
++        }
++        ggml_tensor * out = ggml_inkling_mix(ctx, stack, cur, query, 1e-6f, 1.0f/sqrtf((float) n_embd));
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_GLU_OP_SITU (Inkling 2 experts)
++struct test_situ : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 4> ne_a;
++    int v; // view (1 : non-contiguous a and b)
++    float beta;
++    float lb;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type, ne_a, v, beta, lb);
++    }
++
++    test_situ(ggml_type type = GGML_TYPE_F32,
++              std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
++              int v = 0, float beta = 4.0f, float lb = 25.0f)
++        : type(type), ne_a(ne_a), v(v), beta(beta), lb(lb) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        ggml_tensor * b;
++        if (v & 1) {
++            auto ne = ne_a; ne[0] *= 3;
++            a = ggml_new_tensor(ctx, type, 4, ne.data());
++            ggml_set_param(a);
++            ggml_set_name(a, "a");
++            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
++            ggml_set_name(a, "view_of_a");
++
++            b = ggml_new_tensor(ctx, type, 4, ne.data());
++            ggml_set_param(b);
++            ggml_set_name(b, "b");
++            b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
++            ggml_set_name(b, "view_of_b");
++        } else {
++            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
++            ggml_set_param(a);
++            ggml_set_name(a, "a");
++            b = ggml_new_tensor(ctx, type, 4, ne_a.data());
++            ggml_set_param(b);
++            ggml_set_name(b, "b");
++        }
++
++        ggml_tensor * out = ggml_situ(ctx, a, b, beta, lb);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            // wide range so tanh saturates and sigmoid hits both tails
++            init_tensor_uniform(t, -40.0f, 40.0f);
++        }
++    }
++};
++
+ struct test_swiglu_oai : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+@@ -10855,7 +10936,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+         for (int v : {0, 1}) {
+             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
+-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
++                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
+                     continue;
+                 }
+ 
+@@ -10880,6 +10961,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (int64_t n_blocks : {0, 1, 5, 9}) {
++        for (int64_t n_q : {1, 3, 4}) {
++            for (int64_t n_tokens : {1, 3}) {
++                test_cases.emplace_back(new test_inkling_mix(2304, n_blocks, n_q, n_tokens));
++            }
++        }
++    }
++    test_cases.emplace_back(new test_inkling_mix(64, 2, 2, 5));
++
++    for (int v : {0, 1}) {
++        for (float beta : {1.0f, 4.0f}) {
++            for (float lb : {0.0f, 25.0f}) {
++                test_cases.emplace_back(new test_situ(GGML_TYPE_F32, { 128, 2, 2, 2 }, v, beta, lb));
++                test_cases.emplace_back(new test_situ(GGML_TYPE_F32, { 1152, 8, 1, 1 }, v, beta, lb)); // Inkling 2 Mini expert width x 8 experts
++            }
++        }
++    }
++
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+         for (int v : {0, 1}) {
+             for (float limit : {2.0f, 10.0f}) {
+-- 
+2.56.1.windows.1
+
