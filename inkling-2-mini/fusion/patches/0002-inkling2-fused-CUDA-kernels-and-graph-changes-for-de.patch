@@ -1,5 +1,5 @@
 From 6ca86622ead943b9ba9e175a46958ca441e5e08f Mon Sep 17 00:00:00 2001
-From: bwright000 <benjamin.wright.25@ucl.ac.uk>
+From: bwright000 <238664802+bwright000@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 19:30:12 +0000
 Subject: [PATCH 2/3] inkling2: fused CUDA kernels and graph changes for decode
  speed
