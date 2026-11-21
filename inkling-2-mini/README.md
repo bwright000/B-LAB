@@ -36,7 +36,7 @@ We ran Thinking Machines' Inkling 2 Mini (26B MoE: 128 experts, top-8, with laye
 
 ## Reproducing
 
-1. Check out llama.cpp at the base of PR #32218 and apply that PR.
+1. Check out llama.cpp at `e412c6f46` (the base we used) and apply PR #32218.
 2. Then `git am fusion/patches/0002-*.patch fusion/patches/0003-*.patch`.
 3. Build with CUDA for `sm_120` (`fusion/build.cmd`).
 4. GGUFs: Unsloth's Inkling 2 Mini UD-Q3_K_XL, and the DSpark drafter at Q8_0.
