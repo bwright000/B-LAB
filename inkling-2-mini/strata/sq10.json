@@ -1,0 +1,22 @@
+{
+ "exe": "D:\\Models\\Inki\\strata\\engine\\strata-inkling.exe",
+ "args": [
+  "--native",
+  "D:\\Models\\Inki\\strata\\packs\\Inkling-2-Mini-SQ-10.strata",
+  "--max-context",
+  "32768"
+ ],
+ "cwd": "D:\\Models\\Inki\\strata\\control",
+ "tokenizer": "D:\\Models\\Inki\\strata\\tok\\sq10",
+ "model_name": "inkling-2-mini-sq-10",
+ "arch": "inkling2_loop",
+ "log": "D:\\Models\\Inki\\strata\\home\\strata-sq10.log",
+ "lib_dirs": [
+  "D:\\Models\\Inki\\strata\\engine"
+ ],
+ "port": 8092,
+ "drafting": "dspark",
+ "parallel": 1,
+ "gpu": 1,
+ "gpus_asked": true
+}

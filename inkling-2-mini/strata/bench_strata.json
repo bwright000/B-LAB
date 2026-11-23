@@ -1,0 +1,1 @@
+{"name": "strata-sq10-think", "base_url": "http://127.0.0.1:8092", "model": "inkling-2-mini-sq-10", "concurrency": 1, "prefill_lengths": [4096, 16384], "temperature": 1.0}

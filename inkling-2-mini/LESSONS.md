@@ -34,6 +34,16 @@ Written 2026-11-21 after the Inkling 2 Mini runs (`Inki/`). Read this before you
 - **Windows harness:** launch servers via WMI (`Win32_Process.Create`) so they don't inherit the bench's stdout pipe. With `Start-Process`, bench.py hangs forever. Hide the console (`ShowWindow=0`) or the user may Ctrl+C it. PS 5.1 writes a BOM with `-Encoding utf8` (Python's json chokes on it), and `Add-Content` without `-Encoding` writes ANSI. Use `[IO.File]::WriteAllText(..., UTF8Encoding($false))`.
 - **Don't run CPU-heavy jobs (quantizing) during benchmarks.** The model is overhead-bound, so CPU load skews decode.
 
+## Engine-comparison lessons (2026-11-23, Strata)
+- **Compare engines on identical prompt token ids**, not on each server's chat endpoint. Tokenize once, then feed the ids to both (`strata/ab.py`). Chat endpoints differ in template, thinking mode and sampling.
+- **Check what the server does to thinking.** Stock Strata forces Inkling's thinking off. It looked 5x faster per task, and HumanEval fell from 96% to 88%. Run the coding suite before believing a per-task speedup.
+- **A vendor's per-GPU number belongs to one pack.** Strata's 155 tok/s row for this card is the 10.5 GB SQ-10 pack. The 14.3 GB SQ-15 pack "for 16 GB cards" put 340 experts in system RAM here and ran at 59 to 81 tok/s. Read the load line for how many experts are in VRAM.
+- **Streaming-based tok/s breaks when thinking is hidden.** bench.py times from the first visible token, so a server that does not stream thinking reported 112 to 584 tok/s. Use the engine's own decode timing.
+- **Give needle tests enough output tokens.** 256 tokens were spent on hidden thinking and the test read 0/3; with 1,024 it was 3/3.
+- **Test long context at the real length.** Strata's default KV loaded fine at 64K and then died at about 49K tokens. `--kv k8v8` fixed it.
+- **Check test inputs before reporting a bug.** A "mangled Windows path" in a tool call was the shell collapsing `\\` in a heredoc, so the request contained a tab. Build JSON test bodies in Python.
+- **Stopping a server this session did not start needs the user's OK.** Ask early; the GPU work is blocked until then.
+
 ## Gotchas in this environment
 - Unsloth llama.cpp zips: use **cuda12-newer**. The cuda13 zips load only the CPU backend, because only the CUDA 12.8 runtime is installed.
 - Build b12568 renamed `--no-mmap` to `--load-mode none` (`-lm none` in llama-bench).

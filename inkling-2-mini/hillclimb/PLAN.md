@@ -265,3 +265,55 @@ Kernels/token 7,349 → **3,706**. GPU time (median-based) 13.07 → **8.54 ms**
 - **32K + DSpark fits:** -ub 128, q8_0 KV, drafter KV q8_0, --spec-draft-n-ubatch 16. With a 25K-token prompt: no spill, needle 3/3, prefill 875 tok/s, decode at 25K depth 108 tok/s, short-context 131.4 tok/s.
   The spill at ub 256 came from the main model's compute buffer, not the drafter. `start_inkling_fast.ps1` now uses 32K.
 - **Committed on `inkling-fusion` (local):** 4cebc23c9 PR #32218 as published / 6ca86622e fusion work / 5fa5237e4 drafter head fix. Patches in `src/analysis/patches/`.
+
+## Phase 4: engine change, Strata (strata-inkling 0.1.66, release 0.2.20), 2026-11-23
+**Why:** public reports of engines much closer to the ceiling (Maya: 128.7 tok/s plain on a 3090 at 781 launches/token; Strata lists a 5070 Ti at 88.0 / 155.5 tok/s for SQ-15 / SQ-10 and ~4,200 tok/s prefill).
+**Setup:** everything in `D:\Models\Inki\strata` (engine tarball + control zip + SQ-15/SQ-10 packs, all SHA-256 verified against the release digests / HF LFS oids). No installer, nothing system-wide. GPU 1 only (`CUDA_VISIBLE_DEVICES=1`).
+**Method:** `strata\ab.py` feeds the *same prompt token ids* (6 bench.py chat prompts + 4 small coding tasks, low-effort template, 400 new tokens) to llama.cpp (`/completion`) and to `strata-inkling --serve` (stdin line protocol). Decode tok/s excludes prefill on both sides. Control = `start_inkling_fast.ps1` (fused build + DSpark n=2, Q3_K_M-imat, 32K), measured before and after the Strata runs.
+
+### Decode, short context (median tok/s; chat / code)
+| Config | temp 0 | temp 1.0 | VRAM | Notes |
+|---|---|---|---|---|
+| llama.cpp fused + DSpark n=2 (control, before) | 112.9 / 133.1 | 92.9 / 120.0 | 15.4 GB | drafts accepted 50% / 74% |
+| llama.cpp fused + DSpark n=2 (control, after) | 113.5 / 136.1 | - | | |
+| Strata SQ-10, drafter off | 88.4 / 87.4 | - | 11.7 GB | plain decode is SLOWER than our fused build (~105) |
+| **Strata SQ-10, drafter on, 32K fp16 KV** | **136.6 / 179.8** | **99.2 / 139.4** | 12.7 GB | +21% / +33% at temp 0, +7% / +16% at temp 1.0 |
+| Strata SQ-10, drafter on, 64K k8v8 KV | 134.8 / 172.4 | 98.9 / 140.2 | 12.4 GB | 64K costs ~nothing at short context |
+| Strata SQ-15, drafter on | 58.6 / 81.0 | - | 14.7 GB + host | **does not fit**: 340/3072 experts + KV in host RAM |
+| Strata on Unsloth UD-Q3_K_XL GGUF | 55.0 / 55.3 (plain) | - | 14.5 GB + host | 1,013 experts in host RAM; rejects Unsloth's dspark GGUF (`missing tensor dspark.layers.0.self_attn.o_proj.weight`) |
+
+Synthetic `--bench` (4K prompt, 256 tokens): SQ-10 84.3 plain / 160.3 drafted, prefill 2,834-3,407 tok/s; SQ-15 15.6 / 31.5 (hybrid).
+**Where the gain comes from:** not plain decode. Strata's speculative step gives 2.0x over its own plain decode (ours: ~1.3x): a W=4 beam tree from the drafter, sized per step from the drafter's own probabilities (maximise expected tokens / verify cost, cost = 1 + 4.2 x (1 - (15/16)^M) for the MoE expert union), verified in one CUDA graph without touching committed KV/conv state, exact GPU argmax, one commit kernel. Temp > 0 uses a linear block draft + rejection sampling, hence the smaller gain.
+
+### Long context (identical documents, low effort, temp 0)
+| Prompt | Metric | llama.cpp control | Strata SQ-10 |
+|---|---|---|---|
+| 19.6K tok | prefill / decode at depth / turn total | 779 tok/s / 104.7 / 28.3 s | 2,972 / 154.1 / 8.1 s |
+| 29.7K tok | prefill / decode at depth / turn total | 866 tok/s / 89.9 / 38.2 s | 2,770 / 130.2 / 12.8 s |
+| 58.6K tok (64K ctx, `--kv k8v8`) | prefill / decode at depth | n/a (64K variant: ~250 tok/s, 77 at 46K) | 2,203 / 109.9, 13.6 GB VRAM, shared 86 MiB |
+| all | needles / turn-2 cache | 3/3, prompt_ms 337-644 | 3/3, prompt_ms 98-144 |
+bench.py cold prefill on Strata: 3,109 tok/s (3.3K), 3,127 tok/s (12.9K).
+**64K with the default fp16 KV FAILS:** `fatal GPU error: VRAM exhausted growing elastic global KV cache to 49664 tokens` (engine dies, server reloads it). `--kv k8v8` fixes it.
+
+### Coding suite (HumanEval 164 + MBPP 100, temp 1.0)
+| Config | HumanEval | MBPP | avg tokens | sec/task | suite time | gen tok/s |
+|---|---|---|---|---|---|---|
+| llama.cpp fused + DSpark, low effort (2026-11-21) | 97.0% | 92% | 533 / 423 | 4.7 / 3.7 | 19.0 min | 123.5 / 123.8 |
+| **Strata SQ-10, low effort** (`serve_think.py`) | 96.3% | 91% | 605 / 407 | 4.9 / 3.3 | 18.8 min | 136.7 / 131.2 |
+| Strata SQ-10 as shipped (thinking forced off) | 88.4% | 87% | 123 / 77 | 0.9 / 0.6 | 3.4 min | 175.4 / 157.5 |
+| llama.cpp fused + DSpark, Strata-style no-thinking | 86.6% | 81% | 118 / 93 | 1.1 / 0.85 | 4.4 min | 146.0 / 139.7 |
+- SQ-10 (10.5 GB, published KLD 0.05) is as accurate as our Q3_K_M-imat on this suite (249 vs 251 of 264): the quant is not the problem.
+- Stock Strata renders Inkling with `reasoning_effort=none` + a visible-text opener. That, not the engine, is why it looks 5x faster per task, and it costs 9-10 points on HumanEval on either engine.
+- With thinking on, the coding suite takes the same wall time on both engines (+8-10% tok/s, but more tokens written). Same lesson as upq3: tok/s is not time per task.
+
+### Verdict
+- **Small coding tasks, low effort (the priority metric): no gain.** Same accuracy, same suite time. Keep `start_inkling_fast.ps1` as default for that.
+- **Long prompts / agent use: ACCEPTED as an option** (`start_inkling_strata.ps1`): prompt reading 3.2x faster at 30K, decode at depth +45%, 64K context fully in VRAM, 2.9 GB more headroom. That is the Claude Code worker's bottleneck (23K-token system prompt: ~27 s -> est. ~8 s).
+- Anthropic `/v1/messages` tool_use round trip works; 30/30 Windows paths intact in tool arguments (llama.cpp 12/12).
+- **Not verified:** Claude Code end to end on Strata, vision, soak, concurrency, KLD of SQ-10 on our own text (only the vendor's 0.050 / 0.072), SQ-10 at temp 0 on the coding suite.
+- **Measurement traps:** bench.py's c1 is invalid against Strata in thinking mode (thinking is not streamed, so first-visible-token timing inflates tok/s to 112-584); its `--long` needle reported 0/3 only because 256 max tokens were spent on hidden thinking (3/3 with 1024).
+
+### Remaining levers, ranked
+1. Port Strata's confidence-sized draft length to our llama.cpp DSpark path (the drafter's Markov head already yields probabilities; we use a fixed n=2). Est. +10-25% on code at temp 0.
+2. Try Strata + SQ-10 as the Claude Code worker server (64K, k8v8) and measure real task wall time.
+3. Tree (multi-branch) verify in llama.cpp: large effort; upstream PR #32218 is being rewritten, so wait.
